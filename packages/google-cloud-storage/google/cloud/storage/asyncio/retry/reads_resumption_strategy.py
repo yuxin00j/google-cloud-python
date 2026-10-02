@@ -12,8 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
+import collections
+import concurrent.futures
 import logging
-from typing import IO, Any, Dict, List
+import os
+import threading
+from typing import IO, Any, Dict, List, Optional
 
 import google_crc32c
 
@@ -30,6 +35,39 @@ _BIDI_READ_REDIRECTED_TYPE_URL = (
     "type.googleapis.com/google.storage.v2.BidiReadObjectRedirectedError"
 )
 logger = logging.getLogger(__name__)
+
+
+def _int_from_env(name: str, default: int) -> int:
+    """Reads an integer tuning knob from the environment; bad values are ignored."""
+    try:
+        return int(os.environ.get(name, default))
+    except ValueError:
+        return default
+
+
+# Chunks at least this large are checksummed on a worker thread instead of the
+# event-loop thread; smaller chunks are hashed inline, since the executor
+# hand-off would cost about as much as the hash itself. google_crc32c releases
+# the GIL only while hashing read-only buffers of 1 MiB or more, so the workers
+# run fully in parallel with the loop from that size up.
+_CRC32C_OFFLOAD_MIN_BYTES = _int_from_env(
+    "GOOGLE_CLOUD_STORAGE_CRC32C_OFFLOAD_MIN_BYTES", 512 * 1024
+)
+# Upper bound on chunks awaiting verification per download_ranges() call, so
+# a slow worker cannot pin an unbounded number of received messages.
+_CRC32C_MAX_PENDING = 32
+_crc32c_executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
+_crc32c_executor_lock = threading.Lock()
+
+
+def _get_crc32c_executor() -> concurrent.futures.ThreadPoolExecutor:
+    global _crc32c_executor
+    with _crc32c_executor_lock:
+        if _crc32c_executor is None:
+            _crc32c_executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=2, thread_name_prefix="gcs-crc32c"
+            )
+        return _crc32c_executor
 
 
 class _DownloadState:
@@ -139,13 +177,28 @@ class _ReadResumptionStrategy(_BaseResumptionStrategy):
 
             if checksum_enabled and checksummed_data.HasField("crc32c"):
                 server_checksum = checksummed_data.crc32c
-                client_checksum = google_crc32c.value(data)
-                if server_checksum != client_checksum:
-                    raise DataCorruption(
-                        response,
-                        f"Checksum mismatch for read_id {read_id}. "
-                        f"Server sent {server_checksum}, client calculated {client_checksum}.",
-                    )
+                if (
+                    len(data) >= _CRC32C_OFFLOAD_MIN_BYTES
+                    and read_state.rolling_checksum is None
+                ):
+                    # Hash off the loop thread; verify_pending_checksums()
+                    # raises DataCorruption before download_ranges() returns.
+                    # Full-object reads are excluded: they already fold every
+                    # chunk into rolling_checksum on this thread below, so a
+                    # second hash on a worker would only add CPU work.
+                    future = _get_crc32c_executor().submit(google_crc32c.value, data)
+                    pending = state.get("pending_checksums")
+                    if pending is None:
+                        pending = state["pending_checksums"] = collections.deque()
+                    pending.append((future, server_checksum, read_id, response))
+                else:
+                    client_checksum = google_crc32c.value(data)
+                    if server_checksum != client_checksum:
+                        raise DataCorruption(
+                            response,
+                            f"Checksum mismatch for read_id {read_id}. "
+                            f"Server sent {server_checksum}, client calculated {client_checksum}.",
+                        )
 
             # Update State & Write Data
             chunk_size = len(data)
@@ -190,8 +243,43 @@ class _ReadResumptionStrategy(_BaseResumptionStrategy):
                                 f"Server authoritative crc32c: {full_obj_server_crc32c}, client calculated rolling: {client_checksum}.",
                             )
 
+    async def verify_pending_checksums(
+        self, state: Dict[str, Any], max_pending: int = 0
+    ) -> None:
+        """Awaits offloaded chunk checksums until at most max_pending remain.
+
+        Raises DataCorruption on the first mismatch, cancelling any checksums
+        still queued behind it. Chunks are verified in arrival order, so the
+        backlog is bounded without stalling the stream.
+        """
+        pending = state.get("pending_checksums")
+        if not pending:
+            return
+        while len(pending) > max_pending:
+            future, server_checksum, read_id, response = pending[0]
+            if future.done():
+                client_checksum = future.result()
+            else:
+                client_checksum = await asyncio.wrap_future(future)
+            pending.popleft()
+            if server_checksum != client_checksum:
+                for entry in pending:
+                    entry[0].cancel()
+                pending.clear()
+                raise DataCorruption(
+                    response,
+                    f"Checksum mismatch for read_id {read_id}. "
+                    f"Server sent {server_checksum}, client calculated {client_checksum}.",
+                )
+
     async def recover_state_on_failure(self, error: Exception, state: Any) -> None:
-        """Handles BidiReadObjectRedirectedError for reads."""
+        """Verifies offloaded checksums, then handles BidiReadObjectRedirectedError.
+
+        Chunks whose checksum is still pending have already been written to the
+        user buffer and advanced the resume offset, so a corrupt one must be
+        reported before the stream is reopened from that offset.
+        """
+        await self.verify_pending_checksums(state)
         routing_token, read_handle = _handle_redirect(error)
         if routing_token:
             state["routing_token"] = routing_token
