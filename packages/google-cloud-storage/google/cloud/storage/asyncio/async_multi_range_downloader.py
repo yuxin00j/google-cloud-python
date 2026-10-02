@@ -40,6 +40,7 @@ from google.cloud.storage.asyncio.retry.bidi_stream_retry_manager import (
     _BidiStreamRetryManager,
 )
 from google.cloud.storage.asyncio.retry.reads_resumption_strategy import (
+    _CRC32C_MAX_PENDING,
     _DownloadState,
     _ReadResumptionStrategy,
 )
@@ -447,6 +448,7 @@ class AsyncMultiRangeDownloader:
 
         read_ids = set(download_states.keys())
         queue = self._multiplexer.register(read_ids)
+        strategy = _ReadResumptionStrategy()
 
         try:
             attempt_count = 0
@@ -522,16 +524,21 @@ class AsyncMultiRangeDownloader:
                                         data_range.read_range.read_id
                                     )
                         yield item
+                        # The strategy has consumed `item` by now; keep the
+                        # offloaded checksum backlog bounded.
+                        await strategy.verify_pending_checksums(
+                            state, _CRC32C_MAX_PENDING
+                        )
 
                 return generator()
 
-            strategy = _ReadResumptionStrategy()
             retry_manager = _BidiStreamRetryManager(
                 strategy, send_and_recv_via_multiplexer
             )
 
             try:
                 await retry_manager.execute(initial_state, retry_policy)
+                await strategy.verify_pending_checksums(initial_state)
             except DataCorruption:
                 if self.is_stream_open:
                     await self.close()

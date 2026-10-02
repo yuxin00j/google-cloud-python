@@ -21,6 +21,7 @@ from google.api_core import exceptions
 
 from google.cloud import _storage_v2 as storage_v2
 from google.cloud._storage_v2.types.storage import BidiReadObjectRedirectedError
+from google.cloud.storage.asyncio.retry import reads_resumption_strategy
 from google.cloud.storage.asyncio.retry.reads_resumption_strategy import (
     _DownloadState,
     _ReadResumptionStrategy,
@@ -308,6 +309,62 @@ class TestReadResumptionStrategy(unittest.TestCase):
 
         with self.assertRaisesRegex(DataCorruption, "Checksum mismatch"):
             self.strategy.update_state_from_response(response, self.state)
+
+    # --- Offloaded Checksum Tests ---
+
+    def _large_chunk(self):
+        return b"x" * reads_resumption_strategy._CRC32C_OFFLOAD_MIN_BYTES
+
+    def test_update_state_large_chunk_defers_checksum(self):
+        """Large chunks are written at once and verified by verify_pending_checksums."""
+        content = self._large_chunk()
+        buffer = io.BytesIO()
+        self._add_download(_READ_ID, length=len(content), buffer=buffer)
+        response = self._create_response(content, _READ_ID, offset=0, range_end=True)
+
+        self.strategy.update_state_from_response(response, self.state)
+
+        self.assertEqual(buffer.getvalue(), content)
+        self.assertEqual(len(self.state["pending_checksums"]), 1)
+        asyncio.run(self.strategy.verify_pending_checksums(self.state))
+        self.assertEqual(self.state["pending_checksums"], [])
+
+    def test_verify_pending_checksums_raises_on_mismatch(self):
+        content = self._large_chunk()
+        self._add_download(_READ_ID, length=len(content))
+        response = self._create_response(content, _READ_ID, offset=0, crc=999999)
+
+        self.strategy.update_state_from_response(response, self.state)
+
+        with self.assertRaisesRegex(DataCorruption, "Checksum mismatch"):
+            asyncio.run(self.strategy.verify_pending_checksums(self.state))
+
+    def test_verify_pending_checksums_honors_max_pending(self):
+        content = self._large_chunk()
+        self._add_download(_READ_ID, length=3 * len(content))
+        for i in range(3):
+            response = self._create_response(content, _READ_ID, offset=i * len(content))
+            self.strategy.update_state_from_response(response, self.state)
+        self.assertEqual(len(self.state["pending_checksums"]), 3)
+
+        asyncio.run(self.strategy.verify_pending_checksums(self.state, max_pending=2))
+        self.assertEqual(len(self.state["pending_checksums"]), 2)
+        asyncio.run(self.strategy.verify_pending_checksums(self.state))
+        self.assertEqual(len(self.state["pending_checksums"]), 0)
+
+    def test_verify_pending_checksums_without_pending_is_noop(self):
+        asyncio.run(self.strategy.verify_pending_checksums(self.state))
+        self.assertNotIn("pending_checksums", self.state)
+
+    def test_update_state_large_chunk_not_deferred_when_checksum_disabled(self):
+        content = self._large_chunk()
+        self.state["enable_checksum"] = False
+        self._add_download(_READ_ID, length=len(content))
+        response = self._create_response(content, _READ_ID, offset=0, crc=999999)
+
+        self.strategy.update_state_from_response(response, self.state)
+
+        self.assertNotIn("pending_checksums", self.state)
 
     def test_update_state_final_byte_count_mismatch(self):
         """Test mismatch between expected length and actual bytes written on completion."""
