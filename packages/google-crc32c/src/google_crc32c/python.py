@@ -54,7 +54,7 @@ class Checksum(CommonChecksum):
     """Hashlib-alike helper for CRC32C operations.
 
     Args:
-        initial_value (Optional[bytes]): the initial chunk of data from
+        initial_value (Optional[bytes-like]): the initial chunk of data from
             which the CRC32C checksum is computed.  Defaults to b''.
     """
 
@@ -67,7 +67,7 @@ class Checksum(CommonChecksum):
         """Update the checksum with a new chunk of data.
 
         Args:
-            chunk (Optional[bytes]): a chunk of data used to extend
+            chunk (Optional[bytes-like]): a chunk of data used to extend
                 the CRC32C checksum.
         """
         if not isinstance(data, array.array) or data.itemsize != 1:
