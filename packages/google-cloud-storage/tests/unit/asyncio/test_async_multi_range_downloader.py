@@ -27,6 +27,7 @@ from google.cloud.storage.asyncio import async_read_object_stream
 from google.cloud.storage.asyncio.async_multi_range_downloader import (
     AsyncMultiRangeDownloader,
 )
+from google.cloud.storage.asyncio.retry import reads_resumption_strategy
 from google.cloud.storage.exceptions import DataCorruption
 
 _TEST_BUCKET_NAME = "test-bucket"
@@ -328,10 +329,22 @@ class TestAsyncMultiRangeDownloader:
         )
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "test_data",
+        [
+            pytest.param(b"some-data", id="inline"),
+            pytest.param(
+                b"x" * reads_resumption_strategy._CRC32C_OFFLOAD_MIN_BYTES,
+                id="offloaded",
+            ),
+        ],
+    )
     @mock.patch(
         "google.cloud.storage.asyncio.retry.reads_resumption_strategy.google_crc32c.value"
     )
-    async def test_download_ranges_raises_on_checksum_mismatch(self, mock_crc32c_value):
+    async def test_download_ranges_raises_on_checksum_mismatch(
+        self, mock_crc32c_value, test_data
+    ):
         from google.cloud.storage.asyncio._stream_multiplexer import _StreamMultiplexer
         from google.cloud.storage.asyncio.async_multi_range_downloader import (
             AsyncMultiRangeDownloader,
@@ -342,7 +355,6 @@ class TestAsyncMultiRangeDownloader:
             spec=async_read_object_stream._AsyncReadObjectStream
         )
 
-        test_data = b"some-data"
         server_checksum = 12345
         mock_crc32c_value.return_value = 54321
 
