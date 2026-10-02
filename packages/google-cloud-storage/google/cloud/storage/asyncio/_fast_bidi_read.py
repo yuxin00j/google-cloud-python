@@ -127,8 +127,15 @@ class _Malformed(ValueError):
     """Raised when the wire bytes do not look like a well-formed message."""
 
 
+_UINT64_MASK = (1 << 64) - 1
+_UINT32_MAX = (1 << 32) - 1
+
+
 def _varint(buf, i, end):
-    """Decode the varint at ``buf[i]``; it must end at or before ``end``."""
+    """Decode the varint at ``buf[i]``; it must end at or before ``end``.
+
+    Like upb, accept up to ten bytes and keep only the low 64 bits.
+    """
     shift = 0
     result = 0
     while True:
@@ -142,7 +149,25 @@ def _varint(buf, i, end):
             raise _Malformed("varint longer than 10 bytes")
     if i > end:
         raise _Malformed("varint runs past its enclosing message")
-    return result, i
+    return result & _UINT64_MASK, i
+
+
+def _int64(value):
+    """Reinterpret the low 64 bits of a varint as a signed integer."""
+    return value - (1 << 64) if value >> 63 else value
+
+
+def _tag(buf, i, end):
+    """Decode a field tag at ``buf[i]`` into ``(field_number, wire_type, i)``.
+
+    upb rejects field number 0, tags above 32 bits and tags encoded in more
+    than five bytes.
+    """
+    start = i
+    tag, i = _varint(buf, i, end)
+    if tag < 8 or tag > _UINT32_MAX or i - start > 5:
+        raise _Malformed("invalid field tag")
+    return tag >> 3, tag & 7, i
 
 
 def _length_prefixed(buf, i, end):
@@ -170,29 +195,29 @@ def _skip(buf, i, wt, end):
     return i
 
 
-def _parse_read_range(buf, i, end):
-    rr = _ReadRange()
+# The sub-message parsers fill in an existing object so that a singular
+# embedded message occurring more than once is merged, as the generated
+# parser does, instead of replacing what the earlier occurrence set.
+
+
+def _parse_read_range(rr, buf, i, end):
     while i < end:
-        tag, i = _varint(buf, i, end)
-        f, wt = tag >> 3, tag & 7
+        f, wt, i = _tag(buf, i, end)
         if wt == _WT_VARINT:
             v, i = _varint(buf, i, end)
             if f == 1:
-                rr.read_offset = v
+                rr.read_offset = _int64(v)
             elif f == 2:
-                rr.read_length = v
+                rr.read_length = _int64(v)
             elif f == 3:
-                rr.read_id = v
+                rr.read_id = _int64(v)
         else:
             i = _skip(buf, i, wt, end)
-    return rr
 
 
-def _parse_checksummed(buf, mv, i, end):
-    cd = _ChecksummedData()
+def _parse_checksummed(cd, buf, mv, i, end):
     while i < end:
-        tag, i = _varint(buf, i, end)
-        f, wt = tag >> 3, tag & 7
+        f, wt, i = _tag(buf, i, end)
         if f == 1 and wt == _WT_LEN:
             start, i = _length_prefixed(buf, i, end)
             cd.content = mv[start:i]
@@ -204,21 +229,19 @@ def _parse_checksummed(buf, mv, i, end):
             i += 4
         else:
             i = _skip(buf, i, wt, end)
-    return cd
 
 
 def _parse_range_data(buf, mv, i, end):
     rd = _ObjectRangeData()
     while i < end:
-        tag, i = _varint(buf, i, end)
-        f, wt = tag >> 3, tag & 7
+        f, wt, i = _tag(buf, i, end)
         if wt == _WT_LEN:
             start, i = _length_prefixed(buf, i, end)
             if f == 1:
-                rd.checksummed_data = _parse_checksummed(buf, mv, start, i)
+                _parse_checksummed(rd.checksummed_data, buf, mv, start, i)
                 rd._has_checksummed_data = True
             elif f == 2:
-                rd.read_range = _parse_read_range(buf, start, i)
+                _parse_read_range(rd.read_range, buf, start, i)
                 rd._has_read_range = True
         elif f == 3 and wt == _WT_VARINT:
             v, i = _varint(buf, i, end)
@@ -228,19 +251,15 @@ def _parse_range_data(buf, mv, i, end):
     return rd
 
 
-def _parse_handle(buf, i, end):
-    handle = b""
+def _parse_handle(handle, buf, i, end):
     while i < end:
-        tag, i = _varint(buf, i, end)
-        f, wt = tag >> 3, tag & 7
+        f, wt, i = _tag(buf, i, end)
         if f == 1 and wt == _WT_LEN:
             start, i = _length_prefixed(buf, i, end)
             handle = bytes(buf[start:i])
         else:
             i = _skip(buf, i, wt, end)
-    # A real message: the handle is stored and passed back in the
-    # BidiReadObjectSpec of the next open, which only accepts the proto type.
-    return _storage_v2.BidiReadHandle(handle=handle)
+    return handle
 
 
 _generated_deserialize = _storage_v2.BidiReadObjectResponse.deserialize
@@ -260,19 +279,23 @@ def deserialize(buf):
         ranges = []
         handle = None
         while i < n:
-            tag, i = _varint(buf, i, n)
-            f, wt = tag >> 3, tag & 7
+            f, wt, i = _tag(buf, i, n)
             if wt == _WT_LEN:
                 start, end = _length_prefixed(buf, i, n)
                 if f == 6:
                     ranges.append(_parse_range_data(buf, mv, start, end))
                 elif f == 7:
-                    handle = _parse_handle(buf, start, end)
+                    handle = _parse_handle(handle or b"", buf, start, end)
                 elif f == 4:
                     return _generated_deserialize(buf)
                 i = end
             else:
                 i = _skip(buf, i, wt, n)
+        if handle is not None:
+            # A real message: the handle is stored and passed back in the
+            # BidiReadObjectSpec of the next open, which only accepts the
+            # proto type.
+            handle = _storage_v2.BidiReadHandle(handle=handle)
         return FastBidiReadObjectResponse(ranges, handle)
     except Exception:
         return _generated_deserialize(buf)

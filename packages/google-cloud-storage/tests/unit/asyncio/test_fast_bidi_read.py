@@ -266,6 +266,70 @@ def test_deserialize_skips_unknown_nested_fields():
     _assert_same_as_generated(buf)
 
 
+@pytest.mark.parametrize(
+    "offset, length, read_id",
+    [
+        pytest.param(-1, -1, -1, id="minus_one"),
+        pytest.param(-5, 0, -(1 << 55), id="negative"),
+        pytest.param(-(1 << 63), (1 << 63) - 1, 1, id="int64_extremes"),
+    ],
+)
+def test_deserialize_signed_int64_read_range(offset, length, read_id):
+    # read_offset, read_length and read_id are int64; negative values travel
+    # as ten-byte two's-complement varints.
+    message = _storage_v2.BidiReadObjectResponse(
+        object_data_ranges=[
+            _storage_v2.ObjectRangeData(
+                read_range=_storage_v2.ReadRange(
+                    read_offset=offset, read_length=length, read_id=read_id
+                )
+            )
+        ]
+    )
+    response = _assert_same_as_generated(
+        _storage_v2.BidiReadObjectResponse.serialize(message)
+    )
+    read_range = response.object_data_ranges[0].read_range
+    assert (read_range.read_offset, read_range.read_length, read_range.read_id) == (
+        offset,
+        length,
+        read_id,
+    )
+
+
+def test_deserialize_over_long_varint_keeps_low_64_bits():
+    # A ten-byte varint may carry up to 70 bits; the generated parser keeps
+    # the low 64 and interprets them as the field's type.
+    over_long = b"\xff" * 9 + b"\x7f"
+    read_range = _tag(_READ_RANGE_ID, 0) + over_long
+    response = _assert_same_as_generated(_response(_range_data(read_range=read_range)))
+    assert response.object_data_ranges[0].read_range.read_id == -1
+
+
+def test_deserialize_merges_split_sub_messages():
+    # A singular embedded message that occurs twice is merged, so the second
+    # occurrence must not reset fields set by the first.
+    read_range = _len_field(
+        _RANGE_READ_RANGE, _varint_field(_READ_RANGE_OFFSET, 4096)
+    ) + _len_field(_RANGE_READ_RANGE, _varint_field(_READ_RANGE_ID, 7))
+    checksummed = _len_field(
+        _RANGE_CHECKSUMMED, _len_field(_CHECKSUMMED_CONTENT, PAYLOAD)
+    ) + _len_field(_RANGE_CHECKSUMMED, _i32_field(_CHECKSUMMED_CRC32C, 1234))
+    buf = _response(
+        _range_data(extra=read_range + checksummed),
+        handle=_len_field(_HANDLE_HANDLE, b"opaque"),
+    ) + _len_field(_RESPONSE_HANDLE, b"")
+
+    response = _assert_same_as_generated(buf)
+
+    [range_data] = response.object_data_ranges
+    assert range_data.read_range.read_offset == 4096
+    assert range_data.read_range.read_id == 7
+    assert bytes(range_data.checksummed_data.content) == PAYLOAD
+    assert range_data.checksummed_data.crc32c == 1234
+    assert response.read_handle.handle == b"opaque"
+
+
 def test_deserialize_metadata_response_uses_generated_parser():
     metadata = _storage_v2.Object(name="o", bucket="projects/_/buckets/b", size=10)
     buf = _storage_v2.BidiReadObjectResponse.serialize(
@@ -321,6 +385,36 @@ def test_deserialize_unknown_group_uses_generated_parser():
         pytest.param(
             _data_response() + _tag(_UNKNOWN, 5) + b"\x00",
             id="truncated_fixed32",
+        ),
+        pytest.param(b"\x00\x00", id="field_number_zero"),
+        pytest.param(
+            _response(_range_data(extra=b"\x00\x00")),
+            id="field_number_zero_in_range_data",
+        ),
+        pytest.param(
+            _response(_range_data(_checksummed(extra=b"\x00\x00"))),
+            id="field_number_zero_in_checksummed_data",
+        ),
+        pytest.param(
+            _response(_range_data(read_range=_read_range(extra=b"\x00\x00"))),
+            id="field_number_zero_in_read_range",
+        ),
+        pytest.param(
+            _response(handle=b"\x00\x00"),
+            id="field_number_zero_in_read_handle",
+        ),
+        pytest.param(
+            # Wire type 6 ensures the pure-Python protobuf backend also raises
+            # DecodeError after _tag() rejects the >32-bit tag value.
+            _tag(1 << 29, 6) + b"\x01" + _data_response(),
+            id="field_number_too_large",
+        ),
+        pytest.param(
+            # Field 6 / wire type 6 padded to a six-byte varint: _tag() rejects
+            # i - start > 5 before inspecting the wire type, and both upb and
+            # the pure-Python backend raise DecodeError on the fallback call.
+            b"\xb6\x80\x80\x80\x80\x00" + _varint(2) + _varint_field(_RANGE_END, 1),
+            id="tag_longer_than_five_bytes",
         ),
     ],
 )
