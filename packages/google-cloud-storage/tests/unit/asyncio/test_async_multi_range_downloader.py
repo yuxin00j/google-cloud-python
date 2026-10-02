@@ -688,6 +688,7 @@ class TestAsyncMultiRangeDownloader:
 
         mock_retry_manager = mock_retry_manager_cls.return_value
         mock_retry_manager.execute = AsyncMock()
+        mock_strategy_cls.return_value.verify_pending_checksums = AsyncMock()
 
         # Act
         # Implicit full read (0, 0) and explicit full read (0, persisted_size=100)
