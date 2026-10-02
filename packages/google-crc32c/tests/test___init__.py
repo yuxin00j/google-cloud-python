@@ -199,6 +199,13 @@ _BYTES_LIKE = [
     pytest.param(bytes, id="bytes"),
     pytest.param(bytearray, id="bytearray"),
     pytest.param(memoryview, id="memoryview"),
+    pytest.param(
+        # A view into the middle of a larger buffer: the slice, not the
+        # exporter's whole buffer, must be hashed.
+        lambda data: memoryview(b"\x00" * 3 + data + b"\xff" * 5)[3:-5],
+        id="memoryview-slice",
+    ),
+    pytest.param(lambda data: memoryview(bytearray(data)), id="memoryview-writable"),
     pytest.param(lambda data: array.array("B", data), id="array"),
 ]
 
@@ -224,6 +231,11 @@ def test_value_w_large_readonly_memoryview(_cext):
 def test_value_w_non_contiguous_memoryview(_cext):
     with pytest.raises(BufferError):
         _cext.value(memoryview(ISCSI_BYTES)[::2])
+
+
+def test_extend_w_non_contiguous_memoryview(_cext):
+    with pytest.raises(BufferError):
+        _cext.extend(0, memoryview(ISCSI_BYTES)[::2])
 
 
 def pytest_generate_tests(metafunc):
@@ -269,6 +281,12 @@ class TestChecksum(object):
         chunk = b"DEADBEEF"
         helper = google_crc32c.Checksum(chunk)
         assert helper._crc == google_crc32c.value(chunk)
+
+    @staticmethod
+    @pytest.mark.parametrize("factory", _BYTES_LIKE)
+    def test_ctor_w_bytes_like(_crc32c, factory):
+        helper = _crc32c.Checksum(factory(ISCSI_BYTES))
+        assert helper._crc == ISCSI_CRC
 
     @staticmethod
     def test_update_array():
