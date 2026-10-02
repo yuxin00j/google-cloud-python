@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import array
 import functools
 import itertools
 from unittest import mock
@@ -194,6 +195,37 @@ def test_value(chunk, expected):
     assert google_crc32c.value(bytes(chunk)) == expected
 
 
+_BYTES_LIKE = [
+    pytest.param(bytes, id="bytes"),
+    pytest.param(bytearray, id="bytearray"),
+    pytest.param(memoryview, id="memoryview"),
+    pytest.param(lambda data: array.array("B", data), id="array"),
+]
+
+
+@pytest.mark.parametrize("factory", _BYTES_LIKE)
+def test_value_w_bytes_like(_crc32c, factory):
+    assert _crc32c.value(factory(ISCSI_BYTES)) == ISCSI_CRC
+
+
+@pytest.mark.parametrize("factory", _BYTES_LIKE)
+def test_extend_w_bytes_like(_crc32c, factory):
+    chunks = [factory(bytes(chunk)) for chunk in iscsi_chunks(7)]
+    assert functools.reduce(_crc32c.extend, chunks, 0) == ISCSI_CRC
+
+
+def test_value_w_large_readonly_memoryview(_cext):
+    # Larger than the 1 MiB threshold above which the C extension releases
+    # the GIL while hashing read-only buffers.
+    data = ISCSI_BYTES * (2 * 1024 * 1024 // ISCSI_LENGTH + 1)
+    assert _cext.value(memoryview(data)) == _cext.value(data)
+
+
+def test_value_w_non_contiguous_memoryview(_cext):
+    with pytest.raises(BufferError):
+        _cext.value(memoryview(ISCSI_BYTES)[::2])
+
+
 def pytest_generate_tests(metafunc):
     if "_crc32c" in metafunc.fixturenames:
         metafunc.parametrize("_crc32c", ["python", "cext"], indirect=True)
@@ -214,6 +246,16 @@ def _crc32c(request):
             pytest.skip("C extension not compiled")  # pragma: NO COVER
     else:  # pragma: NO COVER
         raise ValueError("invalid internal test config")
+
+
+@pytest.fixture
+def _cext():
+    try:
+        from google_crc32c import cext
+    except ImportError:  # pragma: NO COVER
+        pytest.skip("C extension not compiled")  # pragma: NO COVER
+
+    return cext  # pragma: NO COVER
 
 
 class TestChecksum(object):
@@ -245,6 +287,13 @@ class TestChecksum(object):
         helper = google_crc32c.Checksum()
         helper.update(chunk)
         assert helper._crc == google_crc32c.value(chunk)
+
+    @staticmethod
+    @pytest.mark.parametrize("factory", _BYTES_LIKE)
+    def test_update_w_bytes_like(_crc32c, factory):
+        helper = _crc32c.Checksum()
+        helper.update(factory(ISCSI_BYTES))
+        assert helper._crc == ISCSI_CRC
 
     @staticmethod
     def test_update_w_multiple_chunks(_crc32c):
