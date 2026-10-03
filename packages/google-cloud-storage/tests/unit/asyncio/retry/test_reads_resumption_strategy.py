@@ -334,6 +334,20 @@ class TestReadResumptionStrategy(unittest.TestCase):
         with self.assertRaisesRegex(DataCorruption, "Checksum mismatch"):
             self.strategy.update_state_from_response(response, self.state)
 
+    def test_update_state_failed_write_leaves_read_resumable(self):
+        buffer = mock.Mock(spec=io.BytesIO)
+        buffer.write.side_effect = [OSError("disk full"), None]
+        read_state = self._add_download(_READ_ID, length=8, buffer=buffer)
+        response = self._create_response(b"data", _READ_ID, offset=0)
+
+        with self.assertRaises(OSError):
+            self.strategy.update_state_from_response(response, self.state)
+
+        self.assertEqual(read_state.bytes_written, 0)
+        self.assertEqual(read_state.next_expected_offset, 0)
+        self.strategy.update_state_from_response(response, self.state)
+        self.assertEqual(read_state.bytes_written, 4)
+
     # --- Offloaded Checksum Tests ---
 
     def _large_chunk(self):
@@ -349,33 +363,84 @@ class TestReadResumptionStrategy(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
-    def test_update_state_large_chunk_defers_checksum(self):
-        """Large chunks are written at once and verified by verify_pending_checksums."""
+    def test_update_state_holds_large_chunk_until_verified(self):
+        """Large chunks are written only once their offloaded checksum matches."""
         content = self._large_chunk()
-        buffer = io.BytesIO()
-        self._add_download(_READ_ID, length=len(content), buffer=buffer)
+        future = concurrent.futures.Future()
+        self._offload_to([future])
+        read_state = self._add_download(_READ_ID, length=len(content))
         response = self._create_response(content, _READ_ID, offset=0, range_end=True)
 
         self.strategy.update_state_from_response(response, self.state)
 
-        self.assertEqual(buffer.getvalue(), content)
+        self.assertEqual(read_state.user_buffer.getvalue(), b"")
+        self.assertEqual(read_state.bytes_written, 0)
+        self.assertFalse(read_state.is_complete)
+        self.assertEqual(read_state.next_expected_offset, len(content))
         self.assertEqual(len(self.state["pending_checksums"]), 1)
+
+        future.set_result(google_crc32c.value(content))
         asyncio.run(self.strategy.verify_pending_checksums(self.state))
+
+        self.assertEqual(read_state.user_buffer.getvalue(), content)
+        self.assertEqual(read_state.bytes_written, len(content))
+        self.assertTrue(read_state.is_complete)
         self.assertEqual(len(self.state["pending_checksums"]), 0)
 
-    def test_verify_pending_checksums_raises_on_mismatch(self):
+    def test_verify_pending_checksums_mismatch_rewinds_to_corrupt_chunk(self):
+        """Nothing from the corrupt chunk on is written; a retry resumes there."""
         content = self._large_chunk()
-        self._add_download(_READ_ID, length=len(content))
-        response = self._create_response(content, _READ_ID, offset=0, crc=999999)
-
-        self.strategy.update_state_from_response(response, self.state)
+        size = len(content)
+        futures = [concurrent.futures.Future() for _ in range(3)]
+        for future, crc in zip(futures, (google_crc32c.value(content), 999999, 0)):
+            future.set_result(crc)
+        self._offload_to(futures)
+        read_state = self._add_download(_READ_ID, offset=10, length=3 * size)
+        for i in range(3):
+            response = self._create_response(content, _READ_ID, offset=10 + i * size)
+            self.strategy.update_state_from_response(response, self.state)
 
         with self.assertRaisesRegex(DataCorruption, "Checksum mismatch"):
             asyncio.run(self.strategy.verify_pending_checksums(self.state))
 
+        self.assertEqual(read_state.user_buffer.getvalue(), content)
+        self.assertEqual(read_state.bytes_written, size)
+        self.assertEqual(read_state.next_expected_offset, 10 + size)
+        self.assertEqual(len(self.state["pending_checksums"]), 0)
+        (request,) = self.strategy.generate_requests(self.state)
+        self.assertEqual(request.read_offset, 10 + size)
+        self.assertEqual(request.read_length, 2 * size)
+
+    def test_update_state_holds_small_chunk_behind_pending_one(self):
+        """Chunks are written in arrival order, even if verified out of order."""
+        large, small = self._large_chunk(), b"tail"
+        future = concurrent.futures.Future()
+        self._offload_to([future])
+        read_state = self._add_download(_READ_ID, length=len(large) + len(small))
+        responses = [
+            self._create_response(large, _READ_ID, offset=0),
+            self._create_response(small, _READ_ID, offset=len(large), range_end=True),
+        ]
+        for response in responses:
+            self.strategy.update_state_from_response(response, self.state)
+
+        self.assertEqual(read_state.user_buffer.getvalue(), b"")
+        self.assertEqual(len(self.state["pending_checksums"]), 2)
+
+        future.set_result(google_crc32c.value(large))
+        asyncio.run(self.strategy.verify_pending_checksums(self.state))
+
+        self.assertEqual(read_state.user_buffer.getvalue(), large + small)
+        self.assertTrue(read_state.is_complete)
+
     def test_verify_pending_checksums_honors_max_pending(self):
+        """Finished chunks are written at once; unfinished ones only block
+        while more than max_pending are held."""
         content = self._large_chunk()
-        self._add_download(_READ_ID, length=3 * len(content))
+        futures = [concurrent.futures.Future() for _ in range(3)]
+        futures[0].set_result(google_crc32c.value(content))
+        self._offload_to(futures)
+        read_state = self._add_download(_READ_ID, length=3 * len(content))
         for i in range(3):
             response = self._create_response(content, _READ_ID, offset=i * len(content))
             self.strategy.update_state_from_response(response, self.state)
@@ -383,8 +448,13 @@ class TestReadResumptionStrategy(unittest.TestCase):
 
         asyncio.run(self.strategy.verify_pending_checksums(self.state, max_pending=2))
         self.assertEqual(len(self.state["pending_checksums"]), 2)
+        self.assertEqual(read_state.bytes_written, len(content))
+
+        for future in futures[1:]:
+            future.set_result(google_crc32c.value(content))
         asyncio.run(self.strategy.verify_pending_checksums(self.state))
         self.assertEqual(len(self.state["pending_checksums"]), 0)
+        self.assertEqual(read_state.user_buffer.getvalue(), content * 3)
 
     def test_verify_pending_checksums_without_pending_is_noop(self):
         asyncio.run(self.strategy.verify_pending_checksums(self.state))
@@ -422,6 +492,38 @@ class TestReadResumptionStrategy(unittest.TestCase):
 
         self.assertTrue(queued.cancelled())
         self.assertEqual(len(self.state["pending_checksums"]), 0)
+
+    def test_discard_pending_checksums_cancels_and_rewinds(self):
+        content = self._large_chunk()
+        future = concurrent.futures.Future()
+        self._offload_to([future])
+        read_state = self._add_download(_READ_ID, offset=5, length=len(content) + 4)
+        responses = [
+            self._create_response(content, _READ_ID, offset=5),
+            self._create_response(b"tail", _READ_ID, offset=5 + len(content)),
+        ]
+        for response in responses:
+            self.strategy.update_state_from_response(response, self.state)
+
+        self.strategy.discard_pending_checksums(self.state)
+
+        self.assertTrue(future.cancelled())
+        self.assertEqual(len(self.state["pending_checksums"]), 0)
+        self.assertEqual(read_state.next_expected_offset, 5)
+        self.assertEqual(read_state.user_buffer.getvalue(), b"")
+
+    def test_discard_pending_checksums_without_pending_is_noop(self):
+        self.strategy.discard_pending_checksums(self.state)
+        self.assertNotIn("pending_checksums", self.state)
+
+    def test_verify_pending_checksums_checks_byte_count_of_held_chunk(self):
+        content = self._large_chunk()
+        self._add_download(_READ_ID, length=len(content) - 1)
+        response = self._create_response(content, _READ_ID, offset=0, range_end=True)
+        self.strategy.update_state_from_response(response, self.state)
+
+        with self.assertRaisesRegex(DataCorruption, "Byte count mismatch"):
+            asyncio.run(self.strategy.verify_pending_checksums(self.state))
 
     def test_update_state_large_chunk_not_deferred_when_checksum_disabled(self):
         content = self._large_chunk()
@@ -560,23 +662,31 @@ class TestReadResumptionStrategy(unittest.TestCase):
         self.assertEqual(self.state["routing_token"], "existing-token")
 
     def test_recover_state_on_failure_raises_for_corrupt_pending_chunk(self):
-        """A corrupt chunk received before a stream error aborts instead of retrying."""
+        """A corrupt chunk received before a stream error aborts instead of retrying,
+        without writing it; the redirect is still recorded."""
         content = self._large_chunk()
-        self._add_download(_READ_ID, length=len(content))
+        read_state = self._add_download(_READ_ID, length=len(content))
         response = self._create_response(content, _READ_ID, offset=0, crc=999999)
         self.strategy.update_state_from_response(response, self.state)
+        token = "dummy-routing-token"
+        final_error = exceptions.Aborted(
+            "Retry failed", errors=[BidiReadObjectRedirectedError(routing_token=token)]
+        )
 
         with self.assertRaisesRegex(DataCorruption, "Checksum mismatch"):
-            asyncio.run(
-                self.strategy.recover_state_on_failure(
-                    exceptions.ServiceUnavailable("stream reset"), self.state
-                )
-            )
+            asyncio.run(self.strategy.recover_state_on_failure(final_error, self.state))
+
+        self.assertEqual(self.state["routing_token"], token)
+        self.assertEqual(read_state.user_buffer.getvalue(), b"")
+        (request,) = self.strategy.generate_requests(self.state)
+        self.assertEqual(request.read_offset, 0)
 
     def test_recover_state_on_failure_drains_pending_checksums(self):
-        """Verified chunks are drained before the redirect is applied."""
+        """Verified chunks are written before the retry computes its offsets."""
         content = self._large_chunk()
-        self._add_download(_READ_ID, length=len(content))
+        future = concurrent.futures.Future()
+        self._offload_to([future])
+        read_state = self._add_download(_READ_ID, length=2 * len(content))
         response = self._create_response(content, _READ_ID, offset=0)
         self.strategy.update_state_from_response(response, self.state)
         token = "dummy-routing-token"
@@ -584,10 +694,19 @@ class TestReadResumptionStrategy(unittest.TestCase):
             "Retry failed", errors=[BidiReadObjectRedirectedError(routing_token=token)]
         )
 
-        asyncio.run(self.strategy.recover_state_on_failure(final_error, self.state))
+        async def run():
+            asyncio.get_running_loop().call_later(
+                0.01, future.set_result, google_crc32c.value(content)
+            )
+            await self.strategy.recover_state_on_failure(final_error, self.state)
+
+        asyncio.run(run())
 
         self.assertEqual(len(self.state["pending_checksums"]), 0)
         self.assertEqual(self.state["routing_token"], token)
+        self.assertEqual(read_state.user_buffer.getvalue(), content)
+        (request,) = self.strategy.generate_requests(self.state)
+        self.assertEqual(request.read_offset, len(content))
 
     def test_update_state_full_object_checksum_success(self):
         """Test that full object checksum verification succeeds on range_end."""

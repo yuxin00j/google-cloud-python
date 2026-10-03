@@ -524,11 +524,17 @@ class AsyncMultiRangeDownloader:
                                         data_range.read_range.read_id
                                     )
                         yield item
-                        # The strategy has consumed `item` by now; keep the
-                        # offloaded checksum backlog bounded.
+                        # The strategy has consumed `item` by now: write the
+                        # chunks whose checksums are done, and keep the
+                        # backlog bounded.
                         await strategy.verify_pending_checksums(
                             state, _CRC32C_MAX_PENDING
                         )
+
+                    # Write (or reject) every held chunk before the attempt
+                    # ends, so a mismatch is raised inside the retry loop,
+                    # as an inline one is.
+                    await strategy.verify_pending_checksums(state)
 
                 return generator()
 
@@ -537,12 +543,23 @@ class AsyncMultiRangeDownloader:
             )
 
             try:
-                await retry_manager.execute(initial_state, retry_policy)
+                try:
+                    await retry_manager.execute(initial_state, retry_policy)
+                except DataCorruption:
+                    raise
+                except Exception:
+                    # Write the chunks received before the failure; a corrupt
+                    # one is reported instead, as it would have been inline.
+                    await strategy.verify_pending_checksums(initial_state)
+                    raise
                 await strategy.verify_pending_checksums(initial_state)
             except DataCorruption:
                 if self.is_stream_open:
                     await self.close()
                 raise
+            finally:
+                # Drop chunks still held, e.g. after cancellation.
+                strategy.discard_pending_checksums(initial_state)
 
             if initial_state.get("read_handle"):
                 self.read_handle = initial_state["read_handle"]
