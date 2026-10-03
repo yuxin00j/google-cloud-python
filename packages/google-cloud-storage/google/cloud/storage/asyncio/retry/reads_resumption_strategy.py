@@ -18,7 +18,7 @@ import concurrent.futures
 import logging
 import os
 import threading
-from typing import IO, Any, Dict, List, Optional
+from typing import IO, Any, Dict, List, NamedTuple, Optional
 
 import google_crc32c
 
@@ -53,8 +53,9 @@ def _int_from_env(name: str, default: int) -> int:
 _CRC32C_OFFLOAD_MIN_BYTES = _int_from_env(
     "GOOGLE_CLOUD_STORAGE_CRC32C_OFFLOAD_MIN_BYTES", 512 * 1024
 )
-# Upper bound on chunks awaiting verification per download_ranges() call, so
-# a slow worker cannot pin an unbounded number of received messages.
+# Upper bound on chunks held for verification per download_ranges() call.
+# Chunks are written only once their checksum matches, so this keeps a slow
+# worker from pinning an unbounded number of received messages.
 _CRC32C_MAX_PENDING = 32
 _crc32c_executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
 _crc32c_executor_lock = threading.Lock()
@@ -68,6 +69,19 @@ def _get_crc32c_executor() -> concurrent.futures.ThreadPoolExecutor:
                 max_workers=2, thread_name_prefix="gcs-crc32c"
             )
         return _crc32c_executor
+
+
+class _PendingChunk(NamedTuple):
+    """A received chunk that is not written to its buffer yet."""
+
+    read_id: int
+    data: Any
+    range_end: bool
+    response: Any
+    server_checksum: Optional[int]
+    # Worker-side CRC32C of ``data``; None if it was verified (or needs no
+    # verification) on receipt and only waits for the chunks ahead of it.
+    checksum: Optional[concurrent.futures.Future]
 
 
 class _DownloadState:
@@ -85,6 +99,9 @@ class _DownloadState:
         self.initial_length = initial_length
         self.user_buffer = user_buffer
         self.bytes_written = 0
+        # Offset of the next chunk to accept. Runs ahead of
+        # initial_offset + bytes_written while received chunks are held for
+        # checksum verification.
         self.next_expected_offset = initial_offset
         self.is_complete = False
         self.is_full_object_read = is_full_object_read
@@ -174,6 +191,8 @@ class _ReadResumptionStrategy(_BaseResumptionStrategy):
             # Checksum Verification
             checksummed_data = object_data_range.checksummed_data
             data = checksummed_data.content
+            server_checksum = None
+            checksum = None
 
             if checksum_enabled and checksummed_data.HasField("crc32c"):
                 server_checksum = checksummed_data.crc32c
@@ -181,17 +200,13 @@ class _ReadResumptionStrategy(_BaseResumptionStrategy):
                     len(data) >= _CRC32C_OFFLOAD_MIN_BYTES
                     and read_state.rolling_checksum is None
                 ):
-                    # Hash off the loop thread; verify_pending_checksums()
-                    # raises DataCorruption before download_ranges() returns.
+                    # Hash off the loop thread; the chunk is written by
+                    # verify_pending_checksums() once the checksum matches.
                     # Full-object reads are excluded: they already fold every
-                    # chunk into rolling_checksum on this thread below, so a
-                    # second hash on a worker would only add CPU work.
-                    future = _get_crc32c_executor().submit(google_crc32c.value, data)
-                    pending = state.get("pending_checksums")
-                    if pending is None:
-                        pending = state["pending_checksums"] = collections.deque()
-                    pending.append((future, server_checksum, read_id, response))
-                else:
+                    # chunk into rolling_checksum on this thread, so a second
+                    # hash on a worker would only add CPU work.
+                    checksum = _get_crc32c_executor().submit(google_crc32c.value, data)
+                if checksum is None:
                     client_checksum = google_crc32c.value(data)
                     if server_checksum != client_checksum:
                         raise DataCorruption(
@@ -200,88 +215,134 @@ class _ReadResumptionStrategy(_BaseResumptionStrategy):
                             f"Server sent {server_checksum}, client calculated {client_checksum}.",
                         )
 
+            read_state.next_expected_offset += len(data)
+            chunk = _PendingChunk(
+                read_id,
+                data,
+                object_data_range.range_end,
+                response,
+                server_checksum,
+                checksum,
+            )
+            pending = state.get("pending_checksums")
+            if checksum is None and not pending:
+                self._write_chunk(state, chunk)
+            else:
+                # Hold the chunk; chunks are written in arrival order.
+                if pending is None:
+                    pending = state["pending_checksums"] = collections.deque()
+                pending.append(chunk)
+
+    def _write_chunk(self, state: Dict[str, Any], chunk: _PendingChunk) -> None:
+        """Writes a verified chunk to its buffer and runs the end-of-range checks."""
+        read_state = state["download_states"][chunk.read_id]
+        data = chunk.data
+        try:
             # Update State & Write Data
-            chunk_size = len(data)
             read_state.user_buffer.write(data)
 
             # Commit updates only after the write succeeds
-            if checksum_enabled and read_state.rolling_checksum is not None:
+            if (
+                state.get("enable_checksum", True)
+                and read_state.rolling_checksum is not None
+            ):
                 read_state.rolling_checksum.update(data)
-            read_state.bytes_written += chunk_size
-            read_state.next_expected_offset += chunk_size
+            read_state.bytes_written += len(data)
+        except BaseException:
+            # Keep every read resumable right after its written bytes.
+            self.discard_pending_checksums(state)
+            raise
 
-            # Final Byte Count & Full Object Checksum Verification
-            if object_data_range.range_end:
-                read_state.is_complete = True
-                if (
-                    read_state.initial_length != 0
-                    and read_state.bytes_written > read_state.initial_length
-                ):
-                    raise DataCorruption(
-                        response,
-                        f"Byte count mismatch for read_id {read_id}. "
-                        f"Expected {read_state.initial_length}, got {read_state.bytes_written}",
+        # Final Byte Count & Full Object Checksum Verification
+        if chunk.range_end:
+            read_state.is_complete = True
+            if (
+                read_state.initial_length != 0
+                and read_state.bytes_written > read_state.initial_length
+            ):
+                raise DataCorruption(
+                    chunk.response,
+                    f"Byte count mismatch for read_id {chunk.read_id}. "
+                    f"Expected {read_state.initial_length}, got {read_state.bytes_written}",
+                )
+
+            # Perform full-object checksum verification once the stream finishes.
+            if (
+                read_state.is_full_object_read
+                and state.get("enable_checksum", True)
+                and read_state.rolling_checksum is not None
+            ):
+                full_obj_server_crc32c = state.get("full_obj_server_crc32c")
+                if full_obj_server_crc32c is not None:
+                    # Use standard big-endian byte conversion to retrieve the rolling checksum value.
+                    client_checksum = int.from_bytes(
+                        read_state.rolling_checksum.digest(),
+                        byteorder="big",
                     )
-
-                # Perform full-object checksum verification once the stream finishes.
-                if (
-                    read_state.is_full_object_read
-                    and checksum_enabled
-                    and read_state.rolling_checksum is not None
-                ):
-                    full_obj_server_crc32c = state.get("full_obj_server_crc32c")
-                    if full_obj_server_crc32c is not None:
-                        # Use standard big-endian byte conversion to retrieve the rolling checksum value.
-                        client_checksum = int.from_bytes(
-                            read_state.rolling_checksum.digest(),
-                            byteorder="big",
+                    if client_checksum != full_obj_server_crc32c:
+                        raise DataCorruption(
+                            chunk.response,
+                            f"Full object checksum mismatch for read_id {chunk.read_id}. "
+                            f"Server authoritative crc32c: {full_obj_server_crc32c}, client calculated rolling: {client_checksum}.",
                         )
-                        if client_checksum != full_obj_server_crc32c:
-                            raise DataCorruption(
-                                response,
-                                f"Full object checksum mismatch for read_id {read_id}. "
-                                f"Server authoritative crc32c: {full_obj_server_crc32c}, client calculated rolling: {client_checksum}.",
-                            )
 
     async def verify_pending_checksums(
         self, state: Dict[str, Any], max_pending: int = 0
     ) -> None:
-        """Awaits offloaded chunk checksums until at most max_pending remain.
+        """Writes held chunks, in arrival order, once their checksums match.
 
-        Raises DataCorruption on the first mismatch, cancelling any checksums
-        still queued behind it. Chunks are verified in arrival order, so the
-        backlog is bounded without stalling the stream.
+        Returns when at most ``max_pending`` chunks are still held; only an
+        unfinished checksum at the head of the queue is waited for. On a
+        mismatch, raises DataCorruption after discarding every held chunk
+        (see discard_pending_checksums()), so nothing from the corrupt chunk
+        on is written and a retry requests it again.
         """
         pending = state.get("pending_checksums")
-        if not pending:
-            return
-        while len(pending) > max_pending:
-            future, server_checksum, read_id, response = pending[0]
-            if future.done():
-                client_checksum = future.result()
-            else:
-                client_checksum = await asyncio.wrap_future(future)
+        while pending:
+            chunk = pending[0]
+            if chunk.checksum is not None:
+                if not chunk.checksum.done():
+                    if len(pending) <= max_pending:
+                        return
+                    await asyncio.wrap_future(chunk.checksum)
+                client_checksum = chunk.checksum.result()
+                if client_checksum != chunk.server_checksum:
+                    self.discard_pending_checksums(state)
+                    raise DataCorruption(
+                        chunk.response,
+                        f"Checksum mismatch for read_id {chunk.read_id}. "
+                        f"Server sent {chunk.server_checksum}, client calculated {client_checksum}.",
+                    )
             pending.popleft()
-            if server_checksum != client_checksum:
-                for entry in pending:
-                    entry[0].cancel()
-                pending.clear()
-                raise DataCorruption(
-                    response,
-                    f"Checksum mismatch for read_id {read_id}. "
-                    f"Server sent {server_checksum}, client calculated {client_checksum}.",
-                )
+            self._write_chunk(state, chunk)
+
+    def discard_pending_checksums(self, state: Dict[str, Any]) -> None:
+        """Drops held chunks unwritten and rewinds each read to its written end.
+
+        Checksums not yet started on the pool are cancelled. A retry requests
+        the dropped bytes again.
+        """
+        pending = state.get("pending_checksums")
+        if pending:
+            for chunk in pending:
+                if chunk.checksum is not None:
+                    chunk.checksum.cancel()
+            pending.clear()
+        for read_state in state["download_states"].values():
+            read_state.next_expected_offset = (
+                read_state.initial_offset + read_state.bytes_written
+            )
 
     async def recover_state_on_failure(self, error: Exception, state: Any) -> None:
-        """Verifies offloaded checksums, then handles BidiReadObjectRedirectedError.
+        """Handles BidiReadObjectRedirectedError, then writes held chunks.
 
-        Chunks whose checksum is still pending have already been written to the
-        user buffer and advanced the resume offset, so a corrupt one must be
-        reported before the stream is reopened from that offset.
+        A retry resumes each read right after its written bytes, so held
+        chunks are verified and written first; a corrupt one raises
+        DataCorruption instead.
         """
-        await self.verify_pending_checksums(state)
         routing_token, read_handle = _handle_redirect(error)
         if routing_token:
             state["routing_token"] = routing_token
         if read_handle:
             state["read_handle"] = read_handle
+        await self.verify_pending_checksums(state)
