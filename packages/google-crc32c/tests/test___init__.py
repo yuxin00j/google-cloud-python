@@ -16,6 +16,8 @@ import ctypes
 import functools
 import itertools
 import mmap
+import sys
+import threading
 from unittest import mock
 
 import pytest  # type: ignore
@@ -208,6 +210,10 @@ _BYTES_LIKE = [
         id="memoryview-slice",
     ),
     pytest.param(lambda data: memoryview(bytearray(data)), id="memoryview-writable"),
+    pytest.param(
+        lambda data: memoryview(bytearray(data)).toreadonly(),
+        id="memoryview-readonly",
+    ),
     pytest.param(lambda data: array.array("B", data), id="array"),
     # Multi-byte, 'c' and N-D exporters: their raw bytes are hashed, not items.
     pytest.param(lambda data: array.array("H", data), id="array-H"),
@@ -269,11 +275,61 @@ def test_value_w_str(_crc32c):
         _crc32c.value("DEADBEEF")
 
 
-def test_value_w_large_readonly_memoryview(_cext):
-    # Larger than the 1 MiB threshold above which the C extension releases
-    # the GIL while hashing read-only buffers.
-    data = ISCSI_BYTES * (2 * 1024 * 1024 // ISCSI_LENGTH + 1)
-    assert _cext.value(memoryview(data)) == _cext.value(data)
+# Larger than the 1 MiB threshold above which the C extension releases the
+# GIL for chunks backed by bytes. CRC from the pure-Python implementation.
+LARGE = ISCSI_BYTES * (2 * 1024 * 1024 // ISCSI_LENGTH + 1)
+LARGE_CRC = 0x29CF5F4B
+
+
+@pytest.mark.parametrize("factory", _BYTES_LIKE)
+def test_value_w_large_bytes_like(_cext, factory):
+    assert _cext.value(factory(LARGE)) == LARGE_CRC
+    assert _cext.extend(0, factory(LARGE)) == LARGE_CRC
+
+
+def test_value_w_large_readonly_view_of_bytearray_releases_buffer(_cext):
+    buffer = bytearray(LARGE)
+    view = memoryview(buffer).toreadonly()
+    assert _cext.value(view) == LARGE_CRC
+    assert _cext.extend(0, view) == LARGE_CRC
+    view.release()  # BufferError if the extension kept its export.
+    buffer.append(0)
+
+
+@pytest.mark.parametrize(
+    "factory",
+    [
+        pytest.param(lambda buffer: buffer, id="bytearray"),
+        pytest.param(lambda buffer: memoryview(buffer).toreadonly(), id="readonly"),
+    ],
+)
+def test_value_holds_gil_for_mutable_memory(_cext, factory):
+    # Read-only views of mutable memory can still be written through their
+    # owner, so the GIL must stay held while they are hashed. With a 10 s
+    # switch interval this thread keeps the GIL until value() releases it or
+    # join() blocks, so the probe sees in_call=True only if value() did.
+    data = factory(bytearray(64 * 1024 * 1024))
+    go = threading.Event()
+    in_call = False
+    seen = []
+
+    def probe():
+        go.wait()
+        seen.append(in_call)
+
+    interval = sys.getswitchinterval()
+    sys.setswitchinterval(10)
+    try:
+        thread = threading.Thread(target=probe, daemon=True)
+        thread.start()
+        go.set()
+        in_call = True
+        _cext.value(data)
+        in_call = False
+        thread.join()
+    finally:
+        sys.setswitchinterval(interval)
+    assert seen == [False]
 
 
 def _fortran_order(data):
