@@ -71,6 +71,29 @@ def _get_crc32c_executor() -> concurrent.futures.ThreadPoolExecutor:
         return _crc32c_executor
 
 
+def _reset_crc32c_executor() -> None:
+    """Forgets the parent's pool in a forked child, where it has no threads.
+
+    The lock is replaced too, in case another thread held it during fork().
+    """
+    global _crc32c_executor, _crc32c_executor_lock
+    _crc32c_executor = None
+    _crc32c_executor_lock = threading.Lock()
+
+
+if hasattr(os, "register_at_fork"):  # pragma: no branch - not on Windows
+    os.register_at_fork(after_in_child=_reset_crc32c_executor)
+
+
+def _submit_crc32c(data: Any) -> Optional[concurrent.futures.Future]:
+    """Starts hashing ``data`` on the pool; None if the pool refuses work."""
+    try:
+        return _get_crc32c_executor().submit(google_crc32c.value, data)
+    except RuntimeError:
+        # Raised once interpreter shutdown has begun; hash inline instead.
+        return None
+
+
 class _PendingChunk(NamedTuple):
     """A received chunk that is not written to its buffer yet."""
 
@@ -205,7 +228,7 @@ class _ReadResumptionStrategy(_BaseResumptionStrategy):
                     # Full-object reads are excluded: they already fold every
                     # chunk into rolling_checksum on this thread, so a second
                     # hash on a worker would only add CPU work.
-                    checksum = _get_crc32c_executor().submit(google_crc32c.value, data)
+                    checksum = _submit_crc32c(data)
                 if checksum is None:
                     client_checksum = google_crc32c.value(data)
                     if server_checksum != client_checksum:
