@@ -16,7 +16,10 @@ import asyncio
 import concurrent.futures
 import io
 import os
+import signal
+import threading
 import unittest
+import warnings
 from unittest import mock
 
 import google_crc32c
@@ -525,6 +528,32 @@ class TestReadResumptionStrategy(unittest.TestCase):
         with self.assertRaisesRegex(DataCorruption, "Byte count mismatch"):
             asyncio.run(self.strategy.verify_pending_checksums(self.state))
 
+    def test_update_state_hashes_inline_when_pool_rejects_work(self):
+        """After interpreter shutdown begins, submit() raises RuntimeError."""
+        content = self._large_chunk()
+        executor = mock.Mock()
+        executor.submit.side_effect = RuntimeError(
+            "cannot schedule new futures after interpreter shutdown"
+        )
+        patcher = mock.patch.object(
+            reads_resumption_strategy, "_get_crc32c_executor", return_value=executor
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        read_state = self._add_download(_READ_ID, length=2 * len(content))
+
+        response = self._create_response(content, _READ_ID, offset=0)
+        self.strategy.update_state_from_response(response, self.state)
+        self.assertEqual(read_state.user_buffer.getvalue(), content)
+        self.assertNotIn("pending_checksums", self.state)
+
+        response = self._create_response(
+            content, _READ_ID, offset=len(content), crc=999999
+        )
+        with self.assertRaisesRegex(DataCorruption, "Checksum mismatch"):
+            self.strategy.update_state_from_response(response, self.state)
+        self.assertEqual(read_state.bytes_written, len(content))
+
     def test_update_state_large_chunk_not_deferred_when_checksum_disabled(self):
         content = self._large_chunk()
         self.state["enable_checksum"] = False
@@ -765,3 +794,47 @@ class TestReadResumptionStrategy(unittest.TestCase):
         resp2 = self._create_response(b"data1", _READ_ID, offset=4, range_end=True)
         # Should NOT raise DataCorruption!
         self.strategy.update_state_from_response(resp2, self.state)
+
+
+class TestCrc32cExecutor(unittest.TestCase):
+    def test_reset_drops_the_pool_and_lock(self):
+        patcher = mock.patch.multiple(
+            reads_resumption_strategy,
+            _crc32c_executor=None,
+            _crc32c_executor_lock=threading.Lock(),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        pool = reads_resumption_strategy._get_crc32c_executor()
+        self.addCleanup(pool.shutdown)
+        lock = reads_resumption_strategy._crc32c_executor_lock
+
+        reads_resumption_strategy._reset_crc32c_executor()
+
+        self.assertIsNot(reads_resumption_strategy._crc32c_executor_lock, lock)
+        new_pool = reads_resumption_strategy._get_crc32c_executor()
+        self.addCleanup(new_pool.shutdown)
+        self.assertIsNot(new_pool, pool)
+
+    @unittest.skipUnless(hasattr(os, "fork"), "requires os.fork")
+    def test_forked_child_gets_a_working_pool(self):
+        """The parent's pool has no threads in a forked child; work sent to it
+        would never run."""
+        pool = reads_resumption_strategy._get_crc32c_executor()
+        self.assertEqual(pool.submit(int, "7").result(), 7)
+        with warnings.catch_warnings():
+            # Python 3.12+ warns about forking a process that has threads.
+            warnings.simplefilter("ignore", DeprecationWarning)
+            pid = os.fork()
+        if pid == 0:  # pragma: NO COVER - the child exits without saving coverage
+            ok = False
+            try:
+                signal.alarm(30)  # never leave the parent waiting on a hung child
+                child_pool = reads_resumption_strategy._get_crc32c_executor()
+                ok = child_pool is not pool and (
+                    child_pool.submit(int, "7").result(timeout=10) == 7
+                )
+            finally:
+                os._exit(0 if ok else 1)
+        _, status = os.waitpid(pid, 0)
+        self.assertEqual(os.waitstatus_to_exitcode(status), 0)
