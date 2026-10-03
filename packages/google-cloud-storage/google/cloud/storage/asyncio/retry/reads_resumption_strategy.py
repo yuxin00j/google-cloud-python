@@ -48,8 +48,9 @@ def _int_from_env(name: str, default: int) -> int:
 # Chunks at least this large are checksummed on a worker thread instead of the
 # event-loop thread; smaller chunks are hashed inline, since the executor
 # hand-off would cost about as much as the hash itself. google_crc32c releases
-# the GIL only while hashing read-only buffers of 1 MiB or more, so the workers
-# run fully in parallel with the loop from that size up.
+# the GIL only while hashing chunks of 1 MiB or more backed by ``bytes``
+# (received chunks are), so the workers run fully in parallel with the loop
+# from that size up.
 _CRC32C_OFFLOAD_MIN_BYTES = _int_from_env(
     "GOOGLE_CLOUD_STORAGE_CRC32C_OFFLOAD_MIN_BYTES", 512 * 1024
 )
