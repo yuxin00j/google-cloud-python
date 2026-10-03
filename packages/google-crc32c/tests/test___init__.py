@@ -12,8 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import array
+import ctypes
 import functools
 import itertools
+import mmap
 from unittest import mock
 
 import pytest  # type: ignore
@@ -207,6 +209,19 @@ _BYTES_LIKE = [
     ),
     pytest.param(lambda data: memoryview(bytearray(data)), id="memoryview-writable"),
     pytest.param(lambda data: array.array("B", data), id="array"),
+    # Multi-byte, 'c' and N-D exporters: their raw bytes are hashed, not items.
+    pytest.param(lambda data: array.array("H", data), id="array-H"),
+    pytest.param(lambda data: array.array("I", data), id="array-I"),
+    pytest.param(lambda data: memoryview(data).cast("I"), id="memoryview-cast-I"),
+    pytest.param(lambda data: memoryview(data).cast("c"), id="memoryview-cast-c"),
+    pytest.param(
+        lambda data: memoryview(data).cast("B", [2, len(data) // 2]),
+        id="memoryview-2d",
+    ),
+    pytest.param(
+        lambda data: (ctypes.c_uint16 * (len(data) // 2)).from_buffer_copy(data),
+        id="ctypes-uint16",
+    ),
 ]
 
 
@@ -217,8 +232,41 @@ def test_value_w_bytes_like(_crc32c, factory):
 
 @pytest.mark.parametrize("factory", _BYTES_LIKE)
 def test_extend_w_bytes_like(_crc32c, factory):
-    chunks = [factory(bytes(chunk)) for chunk in iscsi_chunks(7)]
+    # 8-byte chunks hold a whole number of items for every factory.
+    chunks = [factory(bytes(chunk)) for chunk in iscsi_chunks(8)]
     assert functools.reduce(_crc32c.extend, chunks, 0) == ISCSI_CRC
+
+
+def test_value_w_mmap(_crc32c):
+    # Closing the map raises BufferError if an export was not released.
+    with mmap.mmap(-1, ISCSI_LENGTH) as buffer:
+        buffer.write(ISCSI_BYTES)
+        assert _crc32c.value(buffer) == ISCSI_CRC
+        assert _crc32c.extend(0, buffer) == ISCSI_CRC
+
+
+@pytest.mark.parametrize(
+    "empty",
+    [
+        pytest.param(array.array("I"), id="array-I"),
+        pytest.param((ctypes.c_uint8 * 0 * 3)(), id="ctypes-2d"),
+    ],
+)
+def test_value_w_empty_bytes_like(_crc32c, empty):
+    assert _crc32c.value(empty) == EMPTY_CRC
+    assert _crc32c.extend(123, empty) == 123
+
+
+def test_value_w_iterable_of_ints():
+    from google_crc32c import python
+
+    assert python.value(ISCSI_SCSI_READ_10_COMMAND_PDU) == ISCSI_CRC
+    assert python.value(iter(ISCSI_SCSI_READ_10_COMMAND_PDU)) == ISCSI_CRC
+
+
+def test_value_w_str(_crc32c):
+    with pytest.raises(TypeError):
+        _crc32c.value("DEADBEEF")
 
 
 def test_value_w_large_readonly_memoryview(_cext):
@@ -228,14 +276,27 @@ def test_value_w_large_readonly_memoryview(_cext):
     assert _cext.value(memoryview(data)) == _cext.value(data)
 
 
-def test_value_w_non_contiguous_memoryview(_cext):
-    with pytest.raises(BufferError):
-        _cext.value(memoryview(ISCSI_BYTES)[::2])
+def _fortran_order(data):
+    np = pytest.importorskip("numpy")
+    return memoryview(np.frombuffer(data, np.uint8).reshape(2, -1, order="F"))
 
 
-def test_extend_w_non_contiguous_memoryview(_cext):
+_NON_C_CONTIGUOUS = [
+    pytest.param(lambda data: memoryview(data)[::2], id="strided"),
+    pytest.param(_fortran_order, id="fortran-order"),
+]
+
+
+@pytest.mark.parametrize("factory", _NON_C_CONTIGUOUS)
+def test_value_w_non_contiguous_memoryview(_crc32c, factory):
     with pytest.raises(BufferError):
-        _cext.extend(0, memoryview(ISCSI_BYTES)[::2])
+        _crc32c.value(factory(ISCSI_BYTES))
+
+
+@pytest.mark.parametrize("factory", _NON_C_CONTIGUOUS)
+def test_extend_w_non_contiguous_memoryview(_crc32c, factory):
+    with pytest.raises(BufferError):
+        _crc32c.extend(0, factory(ISCSI_BYTES))
 
 
 def pytest_generate_tests(metafunc):
