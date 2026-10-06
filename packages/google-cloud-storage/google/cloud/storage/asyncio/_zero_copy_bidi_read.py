@@ -42,8 +42,8 @@ from google.cloud._storage_v2.services.storage.transports.grpc_asyncio import (
     StorageGrpcAsyncIOTransport,
 )
 
-_ENV_VAR = "GOOGLE_CLOUD_STORAGE_FAST_BIDI_READ"
-_DISABLED_VALUES = ("0", "false", "no", "off")
+_ENV_VAR = "GOOGLE_CLOUD_STORAGE_ZERO_COPY_BIDI_READ"
+_ENABLED_VALUES = ("1", "true", "yes", "on")
 
 _WT_VARINT, _WT_I64, _WT_LEN, _WT_I32 = 0, 1, 2, 5
 
@@ -95,7 +95,7 @@ class _ObjectRangeData:
         raise ValueError(f"Unknown field {name!r}")
 
 
-class FastBidiReadObjectResponse:
+class _ZeroCopyBidiReadObjectResponse:
     """Duck-typed stand-in for a ``BidiReadObjectResponse`` without metadata.
 
     Only the attributes the async read path uses are provided:
@@ -296,7 +296,7 @@ def deserialize(buf):
             # BidiReadObjectSpec of the next open, which only accepts the
             # proto type.
             handle = _storage_v2.BidiReadHandle(handle=handle)
-        return FastBidiReadObjectResponse(ranges, handle)
+        return _ZeroCopyBidiReadObjectResponse(ranges, handle)
     except Exception:
         return _generated_deserialize(buf)
 
@@ -305,12 +305,13 @@ def is_supported():
     """Whether the zero-copy parser may be used in this process.
 
     The parser hands chunk payloads to the read path as ``memoryview`` objects
-    and checksum verification feeds them to ``google_crc32c``; releases of
-    google-crc32c that only accept ``bytes`` there would make every verified
-    read fail, so the generated parser is kept in that case. Setting
-    ``GOOGLE_CLOUD_STORAGE_FAST_BIDI_READ=0`` forces the generated parser too.
+    and checksum verification feeds them to ``google_crc32c``. Because
+    downstream sinks and releases of ``google-crc32c`` that only accept
+    ``bytes`` would fail on ``memoryview``, the zero-copy parser is enabled
+    only when ``GOOGLE_CLOUD_STORAGE_ZERO_COPY_BIDI_READ=1`` is set and
+    ``google_crc32c`` accepts ``memoryview`` inputs.
     """
-    if os.environ.get(_ENV_VAR, "").strip().lower() in _DISABLED_VALUES:
+    if os.environ.get(_ENV_VAR, "").strip().lower() not in _ENABLED_VALUES:
         return False
     try:
         google_crc32c.value(memoryview(b"\0"))
@@ -328,9 +329,9 @@ def wrapped_rpc(transport):
     The callable is the generated transport's stub with :func:`deserialize`
     swapped in, wrapped exactly like ``transport._wrapped_methods`` entries
     (error mapping, no default retry or timeout, the client-info header).
-    Returns ``None`` when the fast path is unsupported or ``transport`` is not
-    the generated grpc_asyncio transport, in which case callers should use the
-    generated wrapped method.
+    Returns ``None`` when the zero-copy path is unsupported or ``transport`` is
+    not the generated grpc_asyncio transport, in which case callers should use
+    the generated wrapped method.
     """
     if not isinstance(transport, StorageGrpcAsyncIOTransport) or not is_supported():
         return None

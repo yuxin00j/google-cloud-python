@@ -26,7 +26,7 @@ from google.cloud import _storage_v2
 from google.cloud._storage_v2.services.storage.transports.grpc_asyncio import (
     StorageGrpcAsyncIOTransport,
 )
-from google.cloud.storage.asyncio import _fast_bidi_read
+from google.cloud.storage.asyncio import _zero_copy_bidi_read
 from google.cloud.storage.asyncio.async_read_object_stream import (
     _AsyncReadObjectStream,
 )
@@ -117,11 +117,11 @@ def _data_response(content=PAYLOAD, crc32c=None, handle=None):
 
 
 def _assert_same_as_generated(buf):
-    """Parse ``buf`` with both parsers and check the fast one matches."""
+    """Parse ``buf`` with both parsers and check the zero-copy one matches."""
     expected = _storage_v2.BidiReadObjectResponse.deserialize(buf)
-    actual = _fast_bidi_read.deserialize(buf)
+    actual = _zero_copy_bidi_read.deserialize(buf)
 
-    assert isinstance(actual, _fast_bidi_read.FastBidiReadObjectResponse)
+    assert isinstance(actual, _zero_copy_bidi_read._ZeroCopyBidiReadObjectResponse)
     assert actual.metadata is None
     assert not actual.HasField("metadata")
     assert actual.HasField("read_handle") == expected._pb.HasField("read_handle")
@@ -184,7 +184,7 @@ def test_deserialize_matches_proto_plus_serialization():
 
 def test_deserialize_content_is_a_view_of_the_wire_buffer():
     buf = _data_response()
-    content = _fast_bidi_read.deserialize(buf).object_data_ranges[0]
+    content = _zero_copy_bidi_read.deserialize(buf).object_data_ranges[0]
     assert content.checksummed_data.content.obj is buf
 
 
@@ -335,16 +335,16 @@ def test_deserialize_metadata_response_uses_generated_parser():
     buf = _storage_v2.BidiReadObjectResponse.serialize(
         _storage_v2.BidiReadObjectResponse(metadata=metadata)
     )
-    response = _fast_bidi_read.deserialize(buf)
+    response = _zero_copy_bidi_read.deserialize(buf)
     assert isinstance(response, _storage_v2.BidiReadObjectResponse)
     assert response.metadata.size == 10
 
 
 def test_deserialize_unknown_group_uses_generated_parser():
-    # Start-group/end-group wire types are valid protobuf that the fast path
-    # does not understand; the generated parser keeps them as unknown fields.
+    # Start-group/end-group wire types are valid protobuf that the zero-copy
+    # path does not understand; the generated parser keeps them as unknown fields.
     buf = _data_response() + _tag(_UNKNOWN, 3) + _tag(_UNKNOWN, 4)
-    response = _fast_bidi_read.deserialize(buf)
+    response = _zero_copy_bidi_read.deserialize(buf)
     assert isinstance(response, _storage_v2.BidiReadObjectResponse)
     assert response.object_data_ranges[0].checksummed_data.content == PAYLOAD
 
@@ -422,24 +422,37 @@ def test_deserialize_malformed_input_raises_like_generated_parser(buf):
     with pytest.raises(DecodeError):
         _storage_v2.BidiReadObjectResponse.deserialize(buf)
     with pytest.raises(DecodeError):
-        _fast_bidi_read.deserialize(buf)
+        _zero_copy_bidi_read.deserialize(buf)
 
 
 def test_has_field_rejects_unknown_names():
-    response = _fast_bidi_read.deserialize(_data_response(crc32c=1))
+    response = _zero_copy_bidi_read.deserialize(_data_response(crc32c=1))
     [range_data] = response.object_data_ranges
     for message in (response, range_data, range_data.checksummed_data):
         with pytest.raises(ValueError):
             message.HasField("no_such_field")
 
 
-def test_fast_response_pb_is_itself():
+def test_zero_copy_response_pb_is_itself():
     # ReadsResumptionStrategy unwraps ``response._pb`` before calling HasField.
-    response = _fast_bidi_read.deserialize(_data_response())
+    response = _zero_copy_bidi_read.deserialize(_data_response())
     assert response._pb is response
 
 
 # --- is_supported --------------------------------------------------------------
+
+
+@pytest.mark.parametrize("value", [None, "", "0", "false", "No", " off "])
+def test_is_supported_disabled_unless_opted_in(monkeypatch, value):
+    assert _zero_copy_bidi_read._ENV_VAR == "GOOGLE_CLOUD_STORAGE_ZERO_COPY_BIDI_READ"
+    probed = []
+    monkeypatch.setattr(google_crc32c, "value", lambda data: probed.append(data) or 0)
+    if value is None:
+        monkeypatch.delenv(_zero_copy_bidi_read._ENV_VAR, raising=False)
+    else:
+        monkeypatch.setenv(_zero_copy_bidi_read._ENV_VAR, value)
+    assert _zero_copy_bidi_read.is_supported() is False
+    assert probed == []
 
 
 def test_is_supported_requires_crc32c_to_accept_memoryview(monkeypatch):
@@ -449,23 +462,17 @@ def test_is_supported_requires_crc32c_to_accept_memoryview(monkeypatch):
         probed_with.append(type(data))
         raise TypeError("argument 1 must be read-only bytes-like object")
 
-    monkeypatch.delenv(_fast_bidi_read._ENV_VAR, raising=False)
+    monkeypatch.setenv(_zero_copy_bidi_read._ENV_VAR, "1")
     monkeypatch.setattr(google_crc32c, "value", bytes_only)
-    assert _fast_bidi_read.is_supported() is False
+    assert _zero_copy_bidi_read.is_supported() is False
     assert probed_with == [memoryview]
 
 
-def test_is_supported_when_crc32c_accepts_memoryview(monkeypatch):
-    monkeypatch.delenv(_fast_bidi_read._ENV_VAR, raising=False)
+@pytest.mark.parametrize("value", ["1", "true", "Yes", " on "])
+def test_is_supported_when_opted_in_and_crc32c_accepts_memoryview(monkeypatch, value):
+    monkeypatch.setenv(_zero_copy_bidi_read._ENV_VAR, value)
     monkeypatch.setattr(google_crc32c, "value", lambda data: len(data))
-    assert _fast_bidi_read.is_supported() is True
-
-
-@pytest.mark.parametrize("value", ["0", "false", "No", " off "])
-def test_is_supported_env_kill_switch(monkeypatch, value):
-    monkeypatch.setattr(google_crc32c, "value", lambda data: len(data))
-    monkeypatch.setenv(_fast_bidi_read._ENV_VAR, value)
-    assert _fast_bidi_read.is_supported() is False
+    assert _zero_copy_bidi_read.is_supported() is True
 
 
 # --- wrapped_rpc ---------------------------------------------------------------
@@ -478,31 +485,31 @@ def _transport(target):
 
 
 def test_wrapped_rpc_ignores_transports_it_does_not_know(monkeypatch):
-    monkeypatch.setattr(_fast_bidi_read, "is_supported", lambda: True)
-    assert _fast_bidi_read.wrapped_rpc(object()) is None
+    monkeypatch.setattr(_zero_copy_bidi_read, "is_supported", lambda: True)
+    assert _zero_copy_bidi_read.wrapped_rpc(object()) is None
 
 
 @pytest.mark.asyncio
 async def test_wrapped_rpc_returns_none_when_unsupported(monkeypatch):
-    monkeypatch.setattr(_fast_bidi_read, "is_supported", lambda: False)
+    monkeypatch.setattr(_zero_copy_bidi_read, "is_supported", lambda: False)
     transport = _transport("localhost:1")
     try:
-        assert _fast_bidi_read.wrapped_rpc(transport) is None
+        assert _zero_copy_bidi_read.wrapped_rpc(transport) is None
     finally:
         await transport.close()
 
 
 @pytest.mark.asyncio
 async def test_wrapped_rpc_is_built_once_per_transport(monkeypatch):
-    monkeypatch.setattr(_fast_bidi_read, "is_supported", lambda: True)
+    monkeypatch.setattr(_zero_copy_bidi_read, "is_supported", lambda: True)
     transport = _transport("localhost:1")
     other = _transport("localhost:1")
     try:
-        rpc = _fast_bidi_read.wrapped_rpc(transport)
+        rpc = _zero_copy_bidi_read.wrapped_rpc(transport)
         assert rpc is not None
         assert rpc is not transport._wrapped_methods[transport.bidi_read_object]
-        assert _fast_bidi_read.wrapped_rpc(transport) is rpc
-        assert _fast_bidi_read.wrapped_rpc(other) is not rpc
+        assert _zero_copy_bidi_read.wrapped_rpc(transport) is rpc
+        assert _zero_copy_bidi_read.wrapped_rpc(other) is not rpc
     finally:
         await transport.close()
         await other.close()
@@ -558,7 +565,7 @@ def keep_google_logger_propagation(monkeypatch):
 async def test_read_object_stream_end_to_end(
     monkeypatch, keep_google_logger_propagation, supported
 ):
-    monkeypatch.setattr(_fast_bidi_read, "is_supported", lambda: supported)
+    monkeypatch.setattr(_zero_copy_bidi_read, "is_supported", lambda: supported)
     crc = google_crc32c.value(PAYLOAD)
     first = _storage_v2.BidiReadObjectResponse.serialize(
         _storage_v2.BidiReadObjectResponse(
@@ -600,7 +607,10 @@ async def test_read_object_stream_end_to_end(
     assert bytes(content) == PAYLOAD
     assert range_data.checksummed_data.crc32c == crc
     assert range_data.read_range.read_id == 7
-    assert isinstance(response, _fast_bidi_read.FastBidiReadObjectResponse) is supported
+    assert (
+        isinstance(response, _zero_copy_bidi_read._ZeroCopyBidiReadObjectResponse)
+        is supported
+    )
 
     assert server.requests[0].read_object_spec.object_ == "o"
     assert server.requests[1].read_ranges[0].read_id == 7

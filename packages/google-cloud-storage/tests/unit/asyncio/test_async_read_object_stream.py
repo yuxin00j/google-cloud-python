@@ -118,7 +118,7 @@ def test_init_with_bucket_object_generation(mock_client, mock_async_bidi_rpc):
     "google.cloud.storage.asyncio.async_grpc_client.AsyncGrpcClient.grpc_client"
 )
 @mock.patch(
-    "google.cloud.storage.asyncio.async_read_object_stream._fast_bidi_read.wrapped_rpc"
+    "google.cloud.storage.asyncio.async_read_object_stream._zero_copy_bidi_read.wrapped_rpc"
 )
 def test_init_prefers_zero_copy_rpc(mock_wrapped_rpc, mock_client, mock_async_bidi_rpc):
     # Arrange
@@ -142,7 +142,7 @@ def test_init_prefers_zero_copy_rpc(mock_wrapped_rpc, mock_client, mock_async_bi
     "google.cloud.storage.asyncio.async_grpc_client.AsyncGrpcClient.grpc_client"
 )
 @mock.patch(
-    "google.cloud.storage.asyncio.async_read_object_stream._fast_bidi_read.wrapped_rpc"
+    "google.cloud.storage.asyncio.async_read_object_stream._zero_copy_bidi_read.wrapped_rpc"
 )
 def test_init_falls_back_to_generated_rpc(
     mock_wrapped_rpc, mock_client, mock_async_bidi_rpc
