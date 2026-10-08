@@ -42,9 +42,12 @@ from google.cloud._storage_v2.services.storage.transports.grpc_asyncio import (
     StorageGrpcAsyncIOTransport,
 )
 
+# Opt-in switch. Accepted spellings match ``_opentelemetry_tracing._parse_bool_env``.
 _ENV_VAR = "GOOGLE_CLOUD_STORAGE_ZERO_COPY_BIDI_READ"
 _ENABLED_VALUES = ("1", "true", "yes", "on")
 
+# Protobuf wire types (low 3 bits of a field tag): varint, 8-byte fixed,
+# length-delimited, 4-byte fixed. Groups (3, 4) are left to the generated parser.
 _WT_VARINT, _WT_I64, _WT_LEN, _WT_I32 = 0, 1, 2, 5
 
 
@@ -127,7 +130,9 @@ class _Malformed(ValueError):
     """Raised when the wire bytes do not look like a well-formed message."""
 
 
+# A 10-byte varint carries 70 bits; like upb, keep only the low 64.
 _UINT64_MASK = (1 << 64) - 1
+# A field tag (``field_number << 3 | wire_type``) must fit in 32 bits, as in upb.
 _UINT32_MAX = (1 << 32) - 1
 
 
