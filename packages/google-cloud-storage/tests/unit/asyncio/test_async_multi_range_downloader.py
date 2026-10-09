@@ -407,7 +407,7 @@ class TestAsyncMultiRangeDownloader:
         executor = mock.Mock()
         executor.submit.side_effect = submit
         patcher = mock.patch.object(
-            reads_resumption_strategy, "_get_crc32c_executor", return_value=executor
+            reads_resumption_strategy, "_crc32c_executor", executor
         )
         response = _storage_v2.BidiReadObjectResponse(
             object_data_ranges=[
@@ -504,7 +504,7 @@ class TestAsyncMultiRangeDownloader:
             task = asyncio.create_task(
                 mrd.download_ranges([(0, 2 * len(content), buffer)])
             )
-            while not reads_resumption_strategy._get_crc32c_executor().submit.called:
+            while not reads_resumption_strategy._crc32c_executor.submit.called:
                 await asyncio.sleep(0)
             await asyncio.sleep(0)
             task.cancel()
