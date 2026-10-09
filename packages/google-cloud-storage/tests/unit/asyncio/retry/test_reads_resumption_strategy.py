@@ -17,7 +17,6 @@ import concurrent.futures
 import io
 import os
 import signal
-import threading
 import unittest
 import warnings
 from unittest import mock
@@ -361,7 +360,7 @@ class TestReadResumptionStrategy(unittest.TestCase):
         executor = mock.Mock()
         executor.submit.side_effect = list(futures)
         patcher = mock.patch.object(
-            reads_resumption_strategy, "_get_crc32c_executor", return_value=executor
+            reads_resumption_strategy, "_crc32c_executor", executor
         )
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -536,7 +535,7 @@ class TestReadResumptionStrategy(unittest.TestCase):
             "cannot schedule new futures after interpreter shutdown"
         )
         patcher = mock.patch.object(
-            reads_resumption_strategy, "_get_crc32c_executor", return_value=executor
+            reads_resumption_strategy, "_crc32c_executor", executor
         )
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -797,30 +796,22 @@ class TestReadResumptionStrategy(unittest.TestCase):
 
 
 class TestCrc32cExecutor(unittest.TestCase):
-    def test_reset_drops_the_pool_and_lock(self):
-        patcher = mock.patch.multiple(
-            reads_resumption_strategy,
-            _crc32c_executor=None,
-            _crc32c_executor_lock=threading.Lock(),
-        )
-        patcher.start()
-        self.addCleanup(patcher.stop)
-        pool = reads_resumption_strategy._get_crc32c_executor()
-        self.addCleanup(pool.shutdown)
-        lock = reads_resumption_strategy._crc32c_executor_lock
+    def test_reset_replaces_the_pool(self):
+        pool = reads_resumption_strategy._crc32c_executor
+        self.addCleanup(setattr, reads_resumption_strategy, "_crc32c_executor", pool)
 
         reads_resumption_strategy._reset_crc32c_executor()
 
-        self.assertIsNot(reads_resumption_strategy._crc32c_executor_lock, lock)
-        new_pool = reads_resumption_strategy._get_crc32c_executor()
+        new_pool = reads_resumption_strategy._crc32c_executor
         self.addCleanup(new_pool.shutdown)
         self.assertIsNot(new_pool, pool)
+        self.assertEqual(new_pool.submit(int, "7").result(), 7)
 
     @unittest.skipUnless(hasattr(os, "fork"), "requires os.fork")
     def test_forked_child_gets_a_working_pool(self):
         """The parent's pool has no threads in a forked child; work sent to it
         would never run."""
-        pool = reads_resumption_strategy._get_crc32c_executor()
+        pool = reads_resumption_strategy._crc32c_executor
         self.assertEqual(pool.submit(int, "7").result(), 7)
         with warnings.catch_warnings():
             # Python 3.12+ warns about forking a process that has threads.
@@ -830,7 +821,7 @@ class TestCrc32cExecutor(unittest.TestCase):
             ok = False
             try:
                 signal.alarm(30)  # never leave the parent waiting on a hung child
-                child_pool = reads_resumption_strategy._get_crc32c_executor()
+                child_pool = reads_resumption_strategy._crc32c_executor
                 ok = child_pool is not pool and (
                     child_pool.submit(int, "7").result(timeout=10) == 7
                 )

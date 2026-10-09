@@ -17,7 +17,6 @@ import collections
 import concurrent.futures
 import logging
 import os
-import threading
 from typing import IO, Any, Dict, List, NamedTuple, Optional
 
 import google_crc32c
@@ -56,28 +55,22 @@ _CRC32C_OFFLOAD_MIN_BYTES = _int_from_env(
 # Chunks are written only once their checksum matches, so this keeps a slow
 # worker from pinning an unbounded number of received messages.
 _CRC32C_MAX_PENDING = 32
-_crc32c_executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
-_crc32c_executor_lock = threading.Lock()
 
 
-def _get_crc32c_executor() -> concurrent.futures.ThreadPoolExecutor:
-    global _crc32c_executor
-    with _crc32c_executor_lock:
-        if _crc32c_executor is None:
-            _crc32c_executor = concurrent.futures.ThreadPoolExecutor(
-                max_workers=2, thread_name_prefix="gcs-crc32c"
-            )
-        return _crc32c_executor
+def _new_crc32c_executor() -> concurrent.futures.ThreadPoolExecutor:
+    return concurrent.futures.ThreadPoolExecutor(
+        max_workers=2, thread_name_prefix="gcs-crc32c"
+    )
+
+
+# Process-wide pool shared by all clients; its threads start on the first submit().
+_crc32c_executor = _new_crc32c_executor()
 
 
 def _reset_crc32c_executor() -> None:
-    """Forgets the parent's pool in a forked child, where it has no threads.
-
-    The lock is replaced too, in case another thread held it during fork().
-    """
-    global _crc32c_executor, _crc32c_executor_lock
-    _crc32c_executor = None
-    _crc32c_executor_lock = threading.Lock()
+    """Replaces the parent's pool in a forked child, where it has no threads."""
+    global _crc32c_executor
+    _crc32c_executor = _new_crc32c_executor()
 
 
 if hasattr(os, "register_at_fork"):  # pragma: no branch - not on Windows
@@ -87,7 +80,7 @@ if hasattr(os, "register_at_fork"):  # pragma: no branch - not on Windows
 def _submit_crc32c(data: Any) -> Optional[concurrent.futures.Future]:
     """Starts hashing ``data`` on the pool; None if the pool refuses work."""
     try:
-        return _get_crc32c_executor().submit(google_crc32c.value, data)
+        return _crc32c_executor.submit(google_crc32c.value, data)
     except RuntimeError:
         # Raised once interpreter shutdown has begun; hash inline instead.
         return None
