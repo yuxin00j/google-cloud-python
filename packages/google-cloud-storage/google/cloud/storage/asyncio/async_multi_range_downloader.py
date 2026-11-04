@@ -16,8 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from io import BytesIO
-from typing import Any, Dict, List, Optional, Tuple
+from typing import IO, Any, Dict, List, Optional, Tuple, Union
 
 from google.api_core import exceptions
 from google.api_core.retry_async import AsyncRetry
@@ -40,6 +39,7 @@ from google.cloud.storage.asyncio.retry.bidi_stream_retry_manager import (
     _BidiStreamRetryManager,
 )
 from google.cloud.storage.asyncio.retry.reads_resumption_strategy import (
+    _CRC32C_MAX_PENDING,
     _DownloadState,
     _ReadResumptionStrategy,
 )
@@ -78,6 +78,61 @@ def _is_read_retryable(exc):
     )
 
 
+class _BytesWriter:
+    """Ensures a ``write()`` destination always receives ``bytes``."""
+
+    __slots__ = ("_buffer",)
+
+    def __init__(self, buffer):
+        self._buffer = buffer
+
+    def write(self, data):
+        return self._buffer.write(data if isinstance(data, bytes) else bytes(data))
+
+
+class _BufferWriter:
+    """Copies chunks directly into a writable buffer supporting the buffer protocol."""
+
+    __slots__ = ("_view", "_pos")
+
+    def __init__(self, buffer, length: int):
+        if length <= 0:
+            raise ValueError("A writable buffer destination requires bytes_to_read > 0")
+        view = memoryview(buffer)
+        try:
+            if view.readonly or not view.c_contiguous:
+                raise ValueError(
+                    "Buffer destination must be a writable, C-contiguous buffer"
+                )
+            nbytes = view.nbytes
+            if nbytes < length:
+                raise ValueError(
+                    f"Buffer destination ({nbytes} bytes) is smaller than "
+                    f"bytes_to_read ({length})"
+                )
+            self._view = view.cast("B")[:length]
+        finally:
+            view.release()
+        self._pos = 0
+
+    def write(self, data):
+        n = len(data)
+        end = self._pos + n
+        self._view[self._pos : end] = data
+        self._pos = end
+        return n
+
+    def close(self):
+        # Lets the caller resize the buffer again.
+        self._view.release()
+
+
+def _wrap_user_buffer(user_buffer, length: int, accepts_memoryview: bool = False):
+    if hasattr(user_buffer, "write"):
+        return user_buffer if accepts_memoryview else _BytesWriter(user_buffer)
+    return _BufferWriter(user_buffer, length)
+
+
 class AsyncMultiRangeDownloader:
     """Provides an interface for downloading multiple ranges of a GCS ``Object``
     concurrently.
@@ -90,7 +145,7 @@ class AsyncMultiRangeDownloader:
         mrd = await AsyncMultiRangeDownloader.create_mrd(
             client, bucket_name="chandrasiri-rs", object_name="test_open9"
         )
-        my_buff1 = open('my_fav_file.txt', 'wb')
+        my_buff1 = open("my_fav_file.txt", "wb")
         my_buff2 = BytesIO()
         my_buff3 = BytesIO()
         my_buff4 = any_object_which_provides_BytesIO_like_interface()
@@ -360,30 +415,48 @@ class AsyncMultiRangeDownloader:
 
     async def download_ranges(
         self,
-        read_ranges: List[Tuple[int, int, BytesIO]],
-        lock: asyncio.Lock = None,
+        read_ranges: List[Tuple[int, int, Union[IO[bytes], bytearray, memoryview]]],
+        lock: Optional[asyncio.Lock] = None,
         retry_policy: Optional[AsyncRetry] = None,
         metadata: Optional[List[Tuple[str, str]]] = None,
         enable_checksum: bool = True,
+        accepts_memoryview: bool = False,
     ) -> None:
         """Downloads multiple byte ranges from the object into the buffers
         provided by user with automatic retries.
 
-        :type read_ranges: List[Tuple[int, int, "BytesIO"]]
+        :type read_ranges: List[Tuple[int, int, Union[IO[bytes], bytearray, memoryview]]]
         :param read_ranges: A list of tuples, where each tuple represents a
             combination of byte_range and writeable buffer in format -
             (`start_byte`, `bytes_to_read`, `writeable_buffer`). Buffer has
             to be provided by the user, and user has to make sure appropriate
             memory is available in the application to avoid out-of-memory crash.
 
+            If ``writeable_buffer`` has a ``write()`` method (e.g.
+            :class:`io.BytesIO`, an open file, or a custom stream), each
+            chunk is passed to ``writeable_buffer.write()`` as ``bytes``
+            (or as a ``memoryview`` when ``accepts_memoryview`` is True).
+            Otherwise, ``writeable_buffer`` must be a writable, C-contiguous
+            buffer supporting the buffer protocol (e.g. :class:`bytearray`
+            or a writable :class:`memoryview` slice) of at least
+            ``bytes_to_read`` bytes (with ``bytes_to_read > 0``), and the SDK
+            copies each chunk directly into it in place (straight from the
+            gRPC response buffer, without an intermediate ``bytes``, when the
+            zero-copy parser is enabled with
+            ``GCS_PYTHON_CLIENT_ZERO_COPY_BIDI_READ=1`` and the installed
+            ``google-crc32c`` accepts ``memoryview``). If fewer than
+            ``bytes_to_read`` bytes are available before end of object,
+            :exc:`BufferError` is raised.
+
             Special cases:
             if the value of `bytes_to_read` is 0, it'll be interpreted as
-            download all contents until the end of the file from `start_byte`.
+            download all contents until the end of the file from `start_byte`
+            (requires a ``write()`` destination).
             Examples:
                 * (0, 0, buffer) : downloads 0 to end , i.e. entire object.
                 * (100, 0, buffer) : downloads from 100 to end.
 
-        :type lock: asyncio.Lock
+        :type lock: Optional[asyncio.Lock]
         :param lock: (Deprecated) This parameter is deprecated and has no effect.
 
         :type retry_policy: :class:`~google.api_core.retry_async.AsyncRetry`
@@ -394,9 +467,37 @@ class AsyncMultiRangeDownloader:
 
         :type enable_checksum: bool
         :param enable_checksum: (Optional) If True, checksums are verified for downloaded data. Defaults to True.
+            Chunks of ``GCS_PYTHON_CLIENT_CRC32C_OFFLOAD_MIN_BYTES`` bytes or
+            more (default 1 MiB) are verified on a worker thread and written to
+            their buffer once the checksum matches; chunks still waiting are
+            discarded if the call is cancelled or a mismatch is found, and a
+            retry requests them again. Setting
+            ``GCS_PYTHON_CLIENT_CRC32C_OFFLOAD_MIN_BYTES=0`` verifies every
+            chunk inline.
+
+        :type accepts_memoryview: bool
+        :param accepts_memoryview: (Optional) If True, ``write()`` destinations
+            may receive each chunk as a read-only :class:`memoryview` of the
+            received gRPC message instead of ``bytes`` (only when the zero-copy
+            parser is enabled with ``GCS_PYTHON_CLIENT_ZERO_COPY_BIDI_READ=1``).
+            The view keeps that message (the whole response, which may also
+            carry other ranges' chunks) alive while the destination or the
+            SDK's most recently processed response references it; use
+            ``bytes(data)`` to keep the data without the message. Destinations
+            must still accept ``bytes``, which the generated parser produces.
+            Unlike buffer destinations (which raise :exc:`BufferError` on
+            short reads), ``write()`` destinations observe each chunk's length
+            and allow short reads clamped at end of object as well as
+            ``bytes_to_read=0``. No effect on buffer destinations. Defaults
+            to False.
 
         :raises ValueError: if the underlying bidi-GRPC stream is not open.
         :raises ValueError: if the length of read_ranges is more than 1000.
+        :raises ValueError: if a buffer destination is read-only, not
+            C-contiguous, smaller than ``bytes_to_read``, or used with
+            ``bytes_to_read <= 0``.
+        :raises BufferError: if fewer than ``bytes_to_read`` bytes are returned
+            for a buffer destination.
         :raises DataCorruption: if a checksum mismatch is detected while reading data.
 
         """
@@ -417,38 +518,42 @@ class AsyncMultiRangeDownloader:
 
         # Initialize Global State for Retry Strategy
         download_states = {}
-        for read_range in read_ranges:
-            read_id = generate_random_56_bit_integer()
-            # Unpack tuple into self-documenting variable names to improve readability.
-            offset, length, user_buffer = read_range
-
-            # Heuristic to detect full object reads:
-            # - Implicit full object read: start offset is 0 and length is 0 (read all).
-            # - Explicit full object read: start offset is 0 and length matches the exact persisted size.
-            is_full_object_read = (offset == 0 and length == 0) or (
-                self.persisted_size is not None
-                and offset == 0
-                and length == self.persisted_size
-            )
-            download_states[read_id] = _DownloadState(
-                initial_offset=offset,
-                initial_length=length,
-                user_buffer=user_buffer,
-                is_full_object_read=is_full_object_read,
-            )
-
-        initial_state = {
-            "download_states": download_states,
-            "read_handle": self.read_handle,
-            "routing_token": None,
-            "enable_checksum": enable_checksum,
-            "full_obj_server_crc32c": self.full_obj_server_crc32c,
-        }
-
-        read_ids = set(download_states.keys())
-        queue = self._multiplexer.register(read_ids)
-
+        read_ids = set()
         try:
+            for read_range in read_ranges:
+                read_id = generate_random_56_bit_integer()
+                # Unpack tuple into self-documenting variable names to improve readability.
+                offset, length, user_buffer = read_range
+
+                # Heuristic to detect full object reads:
+                # - Implicit full object read: start offset is 0 and length is 0 (read all).
+                # - Explicit full object read: start offset is 0 and length matches the exact persisted size.
+                is_full_object_read = (offset == 0 and length == 0) or (
+                    self.persisted_size is not None
+                    and offset == 0
+                    and length == self.persisted_size
+                )
+                download_states[read_id] = _DownloadState(
+                    initial_offset=offset,
+                    initial_length=length,
+                    user_buffer=_wrap_user_buffer(
+                        user_buffer, length, accepts_memoryview
+                    ),
+                    is_full_object_read=is_full_object_read,
+                )
+
+            initial_state = {
+                "download_states": download_states,
+                "read_handle": self.read_handle,
+                "routing_token": None,
+                "enable_checksum": enable_checksum,
+                "full_obj_server_crc32c": self.full_obj_server_crc32c,
+            }
+
+            read_ids = set(download_states.keys())
+            queue = self._multiplexer.register(read_ids)
+            strategy = _ReadResumptionStrategy()
+
             attempt_count = 0
             last_broken_generation = None
 
@@ -522,26 +627,65 @@ class AsyncMultiRangeDownloader:
                                         data_range.read_range.read_id
                                     )
                         yield item
+                        # The strategy has consumed `item` by now: write the
+                        # chunks whose checksums are done, and keep the
+                        # backlog bounded.
+                        await strategy.verify_pending_checksums(
+                            state, _CRC32C_MAX_PENDING
+                        )
+
+                    # Write (or reject) every held chunk before the attempt
+                    # ends, so a mismatch is raised inside the retry loop,
+                    # as an inline one is.
+                    await strategy.verify_pending_checksums(state)
 
                 return generator()
 
-            strategy = _ReadResumptionStrategy()
             retry_manager = _BidiStreamRetryManager(
                 strategy, send_and_recv_via_multiplexer
             )
 
             try:
-                await retry_manager.execute(initial_state, retry_policy)
+                try:
+                    await retry_manager.execute(initial_state, retry_policy)
+                except DataCorruption:
+                    raise
+                except Exception:
+                    # Chunks received before the stream error still have
+                    # in-flight checksum futures in initial_state. Verify them
+                    # before raising the stream error so an earlier corrupt
+                    # chunk raises DataCorruption (matching inline verification)
+                    # and valid chunks already received are written.
+                    await strategy.verify_pending_checksums(initial_state)
+                    raise
+                await strategy.verify_pending_checksums(initial_state)
             except DataCorruption:
                 if self.is_stream_open:
                     await self.close()
                 raise
+            finally:
+                # Drop chunks still held, e.g. after cancellation.
+                strategy.discard_pending_checksums(initial_state)
 
             if initial_state.get("read_handle"):
                 self.read_handle = initial_state["read_handle"]
+
+            for download_state in download_states.values():
+                if (
+                    isinstance(download_state.user_buffer, _BufferWriter)
+                    and download_state.bytes_written != download_state.initial_length
+                ):
+                    raise BufferError(
+                        f"Buffer destination expected {download_state.initial_length} "
+                        f"bytes at offset {download_state.initial_offset}, got "
+                        f"{download_state.bytes_written}"
+                    )
         finally:
             if self._multiplexer is not None:
                 self._multiplexer.unregister(read_ids)
+            for download_state in download_states.values():
+                if isinstance(download_state.user_buffer, _BufferWriter):
+                    download_state.user_buffer.close()
 
     async def close(self):
         """
