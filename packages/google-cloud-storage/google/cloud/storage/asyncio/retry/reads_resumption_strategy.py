@@ -36,27 +36,27 @@ _BIDI_READ_REDIRECTED_TYPE_URL = (
 logger = logging.getLogger(__name__)
 
 
-def _int_from_env(name: str, default: int) -> int:
-    """Reads an integer tuning knob from the environment; bad values are ignored."""
-    try:
-        return int(os.environ.get(name, default))
-    except ValueError:
-        return default
-
-
-# Chunks at least this large are checksummed on a worker thread instead of the
-# event-loop thread; smaller chunks are hashed inline, and 0 (or any value
-# below 1) hashes every chunk inline. The 1 MiB default matches google_crc32c's
-# GIL-release threshold, so offloaded hashes over ``bytes``-backed chunks
-# (received chunks are) always run with the GIL released.
-_CRC32C_OFFLOAD_MIN_BYTES = _int_from_env(
-    "GCS_PYTHON_CLIENT_CRC32C_OFFLOAD_MIN_BYTES",
-    getattr(google_crc32c, "GIL_RELEASE_THRESHOLD", 1024 * 1024),
-)
+# Off-loop CRC32C verification is opt-in: with GCS_PYTHON_CLIENT_CRC32C_OFFLOAD
+# set to ``1`` (or ``true``, ``yes``, ``on``), chunks of at least
+# _CRC32C_OFFLOAD_MIN_BYTES are checksummed on a worker thread instead of the
+# event-loop thread. It helps when the loop thread is the bottleneck (for
+# example, several streams sharing one event loop with no ``bytes`` copy of each
+# chunk on that thread); otherwise it gains little and can be slower. The
+# threshold matches google_crc32c's GIL-release threshold: smaller chunks would
+# hold the GIL on the worker, so they are always hashed inline.
+_CRC32C_OFFLOAD_ENV_VAR = "GCS_PYTHON_CLIENT_CRC32C_OFFLOAD"
+_CRC32C_OFFLOAD_ENABLED_VALUES = ("1", "true", "yes", "on")
+_CRC32C_OFFLOAD_MIN_BYTES = getattr(google_crc32c, "GIL_RELEASE_THRESHOLD", 1024 * 1024)
 # Upper bound on chunks held for verification per download_ranges() call.
 # Chunks are written only once their checksum matches, so this keeps a slow
 # worker from pinning an unbounded number of received messages.
 _CRC32C_MAX_PENDING = 32
+
+
+def _crc32c_offload_enabled() -> bool:
+    """Whether GCS_PYTHON_CLIENT_CRC32C_OFFLOAD opts in to off-loop checksums."""
+    value = os.environ.get(_CRC32C_OFFLOAD_ENV_VAR, "")
+    return value.strip().lower() in _CRC32C_OFFLOAD_ENABLED_VALUES
 
 
 def _new_crc32c_executor() -> concurrent.futures.ThreadPoolExecutor:
@@ -214,9 +214,9 @@ class _ReadResumptionStrategy(_BaseResumptionStrategy):
             if checksum_enabled and checksummed_data.HasField("crc32c"):
                 server_checksum = checksummed_data.crc32c
                 if (
-                    _CRC32C_OFFLOAD_MIN_BYTES > 0
-                    and len(data) >= _CRC32C_OFFLOAD_MIN_BYTES
+                    len(data) >= _CRC32C_OFFLOAD_MIN_BYTES
                     and read_state.rolling_checksum is None
+                    and _crc32c_offload_enabled()
                 ):
                     # Hash off the loop thread; the chunk is written by
                     # verify_pending_checksums() once the checksum matches.
