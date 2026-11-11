@@ -824,13 +824,17 @@ class AsyncMultiRangeDownloader:
 
         :type enable_checksum: bool
         :param enable_checksum: (Optional) If True, checksums are verified for downloaded data. Defaults to True.
-            Chunks of ``GCS_PYTHON_CLIENT_CRC32C_OFFLOAD_MIN_BYTES`` bytes or
-            more (default 1 MiB) are verified on a worker thread and written to
-            their buffer once the checksum matches; chunks still waiting are
-            discarded if the call is cancelled or a mismatch is found, and a
-            retry requests them again. Setting
-            ``GCS_PYTHON_CLIENT_CRC32C_OFFLOAD_MIN_BYTES=0`` verifies every
-            chunk inline.
+            By default every chunk is verified as it is received. Setting
+            ``GCS_PYTHON_CLIENT_CRC32C_OFFLOAD=1`` verifies chunks of 1 MiB or
+            more on a worker thread instead (except in ranges that read the
+            whole object) and writes each one to its buffer once its checksum
+            matches; chunks still waiting are discarded if the call is
+            cancelled or a mismatch is found, and a retry requests them again.
+            This helps when several streams share the event-loop thread and
+            chunks reach their destination without a ``bytes`` copy (the
+            zero-copy parser with a ``google-crc32c`` that accepts
+            ``memoryview``, and ``accepts_memoryview=True`` or a buffer
+            destination).
 
         :type accepts_memoryview: bool
         :param accepts_memoryview: (Optional) If True, ``write()`` destinations

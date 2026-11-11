@@ -14,6 +14,8 @@
 
 import asyncio
 import concurrent.futures
+import contextlib
+import os
 from io import BytesIO
 from unittest import mock
 from unittest.mock import AsyncMock
@@ -36,6 +38,7 @@ _TEST_OBJECT_NAME = "test-object"
 _TEST_OBJECT_SIZE = 1024 * 1024  # 1 MiB
 _TEST_GENERATION_NUMBER = 123456789
 _TEST_READ_HANDLE = b"test-handle"
+_OFFLOAD_ENV_VAR = "GCS_PYTHON_CLIENT_CRC32C_OFFLOAD"
 
 
 def _accept_memoryview_in_crc32c(monkeypatch):
@@ -888,11 +891,12 @@ class TestAsyncMultiRangeDownloader:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        "test_data",
+        "test_data, offload",
         [
-            pytest.param(b"some-data", id="inline"),
+            pytest.param(b"some-data", False, id="inline"),
             pytest.param(
                 b"x" * reads_resumption_strategy._CRC32C_OFFLOAD_MIN_BYTES,
+                True,
                 id="offloaded",
             ),
         ],
@@ -901,7 +905,7 @@ class TestAsyncMultiRangeDownloader:
         "google.cloud.storage.asyncio.retry.reads_resumption_strategy.google_crc32c.value"
     )
     async def test_download_ranges_raises_on_checksum_mismatch(
-        self, mock_crc32c_value, test_data
+        self, mock_crc32c_value, test_data, offload
     ):
         from google.cloud.storage.asyncio._stream_multiplexer import _StreamMultiplexer
         from google.cloud.storage.asyncio.async_multi_range_downloader import (
@@ -938,10 +942,14 @@ class TestAsyncMultiRangeDownloader:
         mrd._multiplexer = _StreamMultiplexer(mock_stream)
 
         buffer = BytesIO()
+        env = {_OFFLOAD_ENV_VAR: "1"} if offload else {}
         with pytest.raises(DataCorruption) as exc_info:
-            with mock.patch(
-                "google.cloud.storage.asyncio.async_multi_range_downloader.generate_random_56_bit_integer",
-                return_value=0,
+            with (
+                mock.patch.dict(os.environ, env),
+                mock.patch(
+                    "google.cloud.storage.asyncio.async_multi_range_downloader.generate_random_56_bit_integer",
+                    return_value=0,
+                ),
             ):
                 await mrd.download_ranges([(0, len(test_data), buffer)])
 
@@ -963,9 +971,17 @@ class TestAsyncMultiRangeDownloader:
 
         executor = mock.Mock()
         executor.submit.side_effect = submit
-        patcher = mock.patch.object(
-            reads_resumption_strategy, "_crc32c_executor", executor
-        )
+
+        @contextlib.contextmanager
+        def patcher():
+            with (
+                mock.patch.object(
+                    reads_resumption_strategy, "_crc32c_executor", executor
+                ),
+                mock.patch.dict(os.environ, {_OFFLOAD_ENV_VAR: "1"}),
+            ):
+                yield
+
         response = _storage_v2.BidiReadObjectResponse(
             object_data_ranges=[
                 _storage_v2.ObjectRangeData(
@@ -994,7 +1010,7 @@ class TestAsyncMultiRangeDownloader:
         mrd.read_obj_str = mock_stream
         mrd._is_stream_open = True
         mrd._multiplexer = _StreamMultiplexer(mock_stream)
-        return mrd, future, patcher
+        return mrd, future, patcher()
 
     @pytest.mark.asyncio
     @mock.patch(

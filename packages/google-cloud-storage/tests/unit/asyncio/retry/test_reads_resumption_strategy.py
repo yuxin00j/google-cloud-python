@@ -35,27 +35,7 @@ from google.cloud.storage.exceptions import DataCorruption
 
 _READ_ID = 1
 LOGGER_NAME = "google.cloud.storage.asyncio.retry.reads_resumption_strategy"
-
-
-class TestIntFromEnv(unittest.TestCase):
-    def test_reads_integer(self):
-        with mock.patch.dict(os.environ, {"GCS_TEST_KNOB": "123"}):
-            self.assertEqual(
-                reads_resumption_strategy._int_from_env("GCS_TEST_KNOB", 7), 123
-            )
-
-    def test_default_when_unset(self):
-        with mock.patch.dict(os.environ, {}, clear=True):
-            self.assertEqual(
-                reads_resumption_strategy._int_from_env("GCS_TEST_KNOB", 7), 7
-            )
-
-    def test_default_for_invalid_values(self):
-        for value in ("", "abc", "1.5"):
-            with mock.patch.dict(os.environ, {"GCS_TEST_KNOB": value}):
-                self.assertEqual(
-                    reads_resumption_strategy._int_from_env("GCS_TEST_KNOB", 7), 7
-                )
+_OFFLOAD_ENV_VAR = "GCS_PYTHON_CLIENT_CRC32C_OFFLOAD"
 
 
 class TestDownloadState(unittest.TestCase):
@@ -355,8 +335,14 @@ class TestReadResumptionStrategy(unittest.TestCase):
     def _large_chunk(self):
         return b"x" * reads_resumption_strategy._CRC32C_OFFLOAD_MIN_BYTES
 
+    def _enable_offload(self):
+        patcher = mock.patch.dict(os.environ, {_OFFLOAD_ENV_VAR: "1"})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def _offload_to(self, futures):
         """Make the strategy hand large chunks to ``futures`` instead of a pool."""
+        self._enable_offload()
         executor = mock.Mock()
         executor.submit.side_effect = list(futures)
         patcher = mock.patch.object(
@@ -364,6 +350,65 @@ class TestReadResumptionStrategy(unittest.TestCase):
         )
         patcher.start()
         self.addCleanup(patcher.stop)
+
+    def test_update_state_verifies_large_chunk_inline_by_default(self):
+        """Off-loop verification is opt-in: unless the flag is on, even 1 MiB
+        chunks are hashed and written as they arrive."""
+        content = b"x" * (1024 * 1024)
+        envs = (
+            {},
+            {"GCS_PYTHON_CLIENT_ZERO_COPY_BIDI_READ": "1"},
+            {_OFFLOAD_ENV_VAR: "0"},
+            {_OFFLOAD_ENV_VAR: "false"},
+            {_OFFLOAD_ENV_VAR: ""},
+            {_OFFLOAD_ENV_VAR: "enabled"},
+        )
+        for read_id, env in enumerate(envs):
+            with self.subTest(env=env), mock.patch.dict(os.environ, env, clear=True):
+                read_state = self._add_download(read_id, length=len(content))
+                response = self._create_response(
+                    content, read_id, offset=0, range_end=True
+                )
+
+                self.strategy.update_state_from_response(response, self.state)
+
+                self.assertEqual(read_state.user_buffer.getvalue(), content)
+                self.assertTrue(read_state.is_complete)
+                self.assertNotIn("pending_checksums", self.state)
+
+    def test_update_state_offloads_large_chunk_when_enabled(self):
+        """GCS_PYTHON_CLIENT_CRC32C_OFFLOAD opts in; the chunk is held until
+        its worker-side checksum verifies."""
+        content = b"x" * (1024 * 1024)
+        for read_id, value in enumerate(("1", "true", "TRUE", " yes ", "on")):
+            with (
+                self.subTest(value=value),
+                mock.patch.dict(os.environ, {_OFFLOAD_ENV_VAR: value}),
+            ):
+                read_state = self._add_download(read_id, length=len(content))
+                response = self._create_response(
+                    content, read_id, offset=0, range_end=True
+                )
+
+                self.strategy.update_state_from_response(response, self.state)
+
+                self.assertEqual(read_state.bytes_written, 0)
+                self.assertEqual(len(self.state["pending_checksums"]), 1)
+                asyncio.run(self.strategy.verify_pending_checksums(self.state))
+                self.assertEqual(read_state.user_buffer.getvalue(), content)
+                self.assertTrue(read_state.is_complete)
+
+    def test_update_state_hashes_chunk_below_1_mib_inline_when_enabled(self):
+        """google_crc32c holds the GIL below 1 MiB, so smaller chunks stay inline."""
+        content = b"x" * (1024 * 1024 - 1)
+        self._enable_offload()
+        read_state = self._add_download(_READ_ID, length=len(content))
+        response = self._create_response(content, _READ_ID, offset=0, range_end=True)
+
+        self.strategy.update_state_from_response(response, self.state)
+
+        self.assertEqual(read_state.user_buffer.getvalue(), content)
+        self.assertNotIn("pending_checksums", self.state)
 
     def test_update_state_holds_large_chunk_until_verified(self):
         """Large chunks are written only once their offloaded checksum matches."""
@@ -513,20 +558,6 @@ class TestReadResumptionStrategy(unittest.TestCase):
         self.assertEqual(len(self.state["pending_checksums"]), 0)
         self.assertEqual(read_state.next_expected_offset, 0)
 
-    def test_update_state_offload_disabled_by_zero_threshold(self):
-        content = self._large_chunk()
-        self._add_download(_READ_ID, length=len(content))
-        with (
-            mock.patch.object(
-                reads_resumption_strategy, "_CRC32C_OFFLOAD_MIN_BYTES", 0
-            ),
-            mock.patch.object(reads_resumption_strategy, "_submit_crc32c") as submit,
-        ):
-            response = self._create_response(content, _READ_ID, offset=0)
-            self.strategy.update_state_from_response(response, self.state)
-        submit.assert_not_called()
-        self.assertFalse(self.state.get("pending_checksums"))
-
     def test_discard_pending_checksums_cancels_and_rewinds(self):
         content = self._large_chunk()
         future = concurrent.futures.Future()
@@ -552,6 +583,7 @@ class TestReadResumptionStrategy(unittest.TestCase):
 
     def test_verify_pending_checksums_checks_byte_count_of_held_chunk(self):
         content = self._large_chunk()
+        self._enable_offload()
         self._add_download(_READ_ID, length=len(content) - 1)
         response = self._create_response(content, _READ_ID, offset=0, range_end=True)
         self.strategy.update_state_from_response(response, self.state)
@@ -562,6 +594,7 @@ class TestReadResumptionStrategy(unittest.TestCase):
     def test_update_state_hashes_inline_when_pool_rejects_work(self):
         """After interpreter shutdown begins, submit() raises RuntimeError."""
         content = self._large_chunk()
+        self._enable_offload()
         executor = mock.Mock()
         executor.submit.side_effect = RuntimeError(
             "cannot schedule new futures after interpreter shutdown"
@@ -587,6 +620,7 @@ class TestReadResumptionStrategy(unittest.TestCase):
 
     def test_update_state_large_chunk_not_deferred_when_checksum_disabled(self):
         content = self._large_chunk()
+        self._enable_offload()
         self.state["enable_checksum"] = False
         self._add_download(_READ_ID, length=len(content))
         response = self._create_response(content, _READ_ID, offset=0, crc=999999)
@@ -599,6 +633,7 @@ class TestReadResumptionStrategy(unittest.TestCase):
         """Full-object reads already hash every chunk into the rolling checksum
         on the calling thread, so a worker-side hash would only be overhead."""
         content = self._large_chunk()
+        self._enable_offload()
         read_state = self._add_download(
             _READ_ID, length=len(content), is_full_object_read=True
         )
@@ -611,6 +646,7 @@ class TestReadResumptionStrategy(unittest.TestCase):
 
     def test_update_state_full_object_read_large_chunk_mismatch_raises_inline(self):
         content = self._large_chunk()
+        self._enable_offload()
         self._add_download(_READ_ID, length=len(content), is_full_object_read=True)
         response = self._create_response(content, _READ_ID, offset=0, crc=999999)
 
@@ -725,6 +761,7 @@ class TestReadResumptionStrategy(unittest.TestCase):
         """A corrupt chunk received before a stream error aborts instead of retrying,
         without writing it; the redirect is still recorded."""
         content = self._large_chunk()
+        self._enable_offload()
         read_state = self._add_download(_READ_ID, length=len(content))
         response = self._create_response(content, _READ_ID, offset=0, crc=999999)
         self.strategy.update_state_from_response(response, self.state)
